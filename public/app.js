@@ -25,7 +25,6 @@
   let audioCtx = null;
   let lastBeepSec = null;
   let prevTurnSig = '';
-  const teamDrafts = {}; // unsaved team-name text per team, so a live refresh never wipes what you're typing
 
   /* ---------- storage ---------- */
   function loadSession() { try { return JSON.parse(localStorage.getItem('fb_session') || 'null'); } catch { return null; } }
@@ -63,8 +62,8 @@
     return j;
   }
   async function act(type, extra = {}) {
-    try { await post('/api/action', { code: session.code, pid: session.pid, type, ...extra }); return true; }
-    catch (e) { toast(e.message, true); return false; }
+    try { await post('/api/action', { code: session.code, pid: session.pid, type, ...extra }); }
+    catch (e) { toast(e.message, true); }
   }
   const initials = (n) => (n || '?').trim().slice(0, 1).toUpperCase();
   const teamName = (t) => (t == null ? '' : S.teamNames[t]);
@@ -113,7 +112,6 @@
       prevTurnSig = sig; lastBeepSec = null;
     }
     if (location.pathname !== `/r/${S.code}`) history.replaceState(null, '', `/r/${S.code}`);
-    if (S.phase !== 'teams') { delete teamDrafts[0]; delete teamDrafts[1]; }
     switch (S.phase) {
       case 'lobby': return renderLobby();
       case 'writing': return renderWriting();
@@ -294,89 +292,20 @@
   }
 
   /* ---------- teams ---------- */
-  async function saveTeamName(team) {
-    const input = $(`.tn[data-team="${team}"]`);
-    const name = input ? input.value : (teamDrafts[team] || '');
-    const ok = await act('renameTeam', { team, name });
-    if (ok) { delete teamDrafts[team]; toast('Team name saved!'); }
-    return ok;
-  }
-
   function renderTeams() {
-    const host = S.me.isHost; const mine = S.me.team;
-    // remember typing + focus so the screen can refresh without disturbing it
-    const ae = document.activeElement;
-    const focus = ae && ae.classList && ae.classList.contains('tn') ? { team: ae.dataset.team, a: ae.selectionStart, b: ae.selectionEnd } : null;
-    document.querySelectorAll('.tn').forEach((el) => {
-      const t = el.dataset.team;
-      if (el.value !== (S.teamNames[t] || '')) teamDrafts[t] = el.value; else delete teamDrafts[t];
-    });
-
-    const inTeam = (t) => S.players.filter((p) => p.team === t);
-    const pool = S.players.filter((p) => p.team !== 0 && p.team !== 1);
-    const n0 = inTeam(0).length; const n1 = inTeam(1).length;
-    const short = (t) => teamName(t);
-    const row = (p, t) => `<li class="${p.id === S.me.id ? 'me' : ''}">
-        <span class="pn">${esc(p.name)}${p.id === S.me.id ? ' (you)' : ''}${!p.connected ? ' <small>(offline)</small>' : ''}</span>
-        ${host ? `<span class="mv"><button type="button" class="mvb" data-act="setTeam" data-id="${esc(p.id)}" data-team="${1 - t}" title="Move to ${esc(short(1 - t))}">→ ${esc(short(1 - t))}</button>
-          <button type="button" class="mvb x" data-act="setTeam" data-id="${esc(p.id)}" data-team="none" title="Unassign" aria-label="Unassign ${esc(p.name)}">✕</button></span>` : ''}
-      </li>`;
-    const nameBox = (t) => {
-      if (S.canRename[t]) {
-        const val = teamDrafts[t] !== undefined ? teamDrafts[t] : S.teamNames[t];
-        return `<div class="tn-row"><input class="tn" data-team="${t}" type="text" maxlength="20" value="${esc(val)}" placeholder="Team name" aria-label="Name for this team" autocomplete="off">
-          <button type="button" class="mvb" data-act="saveName" data-team="${t}">Save</button></div>
-          <div class="tn-note">✎ You choose this team’s name</div>`;
-      }
-      const who = S.namers[t];
-      return who ? `<div class="tn-note">✎ ${esc(who)} chooses this team’s name</div>` : '';
-    };
-    const col = (t) => `<div class="team t${t}"><h3>${esc(teamName(t))} (${inTeam(t).length})</h3>${nameBox(t)}<ul>${inTeam(t).map((p) => row(p, t)).join('') || '<li class="empty">No players yet</li>'}</ul></div>`;
-    const poolHtml = pool.length ? `
-      <div class="pool">
-        <h3>Not on a team yet (${pool.length})</h3>
-        <ul>${pool.map((p) => `<li><span class="pn">${esc(p.name)}${p.id === S.me.id ? ' (you)' : ''}</span>
-          ${host ? `<span class="mv"><button type="button" class="mvb c0" data-act="setTeam" data-id="${esc(p.id)}" data-team="0">${esc(teamName(0))}</button>
-            <button type="button" class="mvb c1" data-act="setTeam" data-id="${esc(p.id)}" data-team="1">${esc(teamName(1))}</button></span>` : ''}</li>`).join('')}</ul>
-      </div>` : '';
-    let status = '';
-    let ready = true;
-    if (pool.length) { ready = false; status = `Assign ${pool.length} more player${pool.length > 1 ? 's' : ''} to a team to continue.`; }
-    else if (!n0 || !n1) { ready = false; status = 'Each team needs at least one player.'; }
-    else if (Math.abs(n0 - n1) > 1) status = `Heads up: teams are uneven (${n0} vs ${n1}). You can still play.`;
-    const you = mine === 0 || mine === 1
-      ? `You’re on <b style="color:${colorFor(mine)}">${esc(teamName(mine))}</b>.`
-      : 'You’re not on a team yet.';
+    const mine = S.me.team;
+    const col = (t) => `<div class="team t${t}"><h3>${esc(teamName(t))} (${S.players.filter((p) => p.team === t).length})</h3><ul>${
+      S.players.filter((p) => p.team === t).map((p) => `<li class="${p.id === S.me.id ? 'me' : ''}">${esc(p.name)}${p.id === S.me.id ? ' (you)' : ''}</li>`).join('')}</ul></div>`;
     view(null, `
       <div class="card wide">
-        <h2 class="center">${host ? 'Set up the teams' : 'Meet the teams!'}</h2>
-        <p class="center muted" style="margin-top:0">${S.totalCards} cards are in the bowl. ${you}</p>
-        ${host ? '<p class="center muted small" style="margin:0 0 12px">Shuffle randomly, or tap a player’s button to move them between teams. You name your team; one player on the other team names theirs.</p>' : ''}
+        <h2 class="center">Meet the teams!</h2>
+        <p class="center muted" style="margin-top:0">${S.totalCards} cards are in the bowl. You’re on <b style="color:${colorFor(mine)}">${esc(teamName(mine))}</b>.</p>
         <div class="teams">${col(0)}${col(1)}</div>
-        ${poolHtml}
         <div class="stack" style="margin-top:18px">
-          ${host ? `
-            <button class="btn block big" data-act="continue" ${ready ? '' : 'disabled'}>Looks good – let’s go!</button>
-            ${status ? `<div class="center small" style="font-weight:600;color:${ready ? '#6b5400' : 'var(--bad)'}">${esc(status)}</div>` : ''}
-            <div class="row" style="gap:10px">
-              <button class="btn ghost" style="flex:1" data-act="reshuffle">🔀 Shuffle randomly</button>
-              <button class="btn ghost" style="flex:1" data-act="clearTeams">✋ Pick manually</button>
-            </div>`
-            : '<div class="center muted" style="font-weight:600">Waiting for the host to finalise the teams…</div>'}
+          ${S.me.isHost ? `<button class="btn block big" data-act="continue">Looks good – let’s go!</button>
+            <button class="btn block ghost" data-act="reshuffle">🔀 Shuffle teams</button>` : '<div class="center muted" style="font-weight:600">Waiting for the host to continue…</div>'}
         </div>
       </div>`);
-    if (focus) {
-      const el = $(`.tn[data-team="${focus.team}"]`);
-      if (el) { el.focus(); try { el.setSelectionRange(focus.a, focus.b); } catch { /* */ } }
-    }
-  }
-
-  async function continueFromTeams() {
-    // don't lose a name that was typed but not saved yet
-    for (const t of [0, 1]) {
-      if (teamDrafts[t] !== undefined && S.canRename[t]) { if (!(await saveTeamName(t))) return; }
-    }
-    return act('toRoundIntro');
   }
 
   /* ---------- round intro ---------- */
@@ -557,10 +486,7 @@
       case 'teams': return act('assignTeams');
       case 'forceTeams': return act('forceStartTeams');
       case 'reshuffle': return act('reshuffleTeams');
-      case 'clearTeams': return act('clearTeams');
-      case 'setTeam': return act('setTeam', { playerId: b.dataset.id, team: b.dataset.team === 'none' ? null : parseInt(b.dataset.team, 10) });
-      case 'saveName': return saveTeamName(parseInt(b.dataset.team, 10));
-      case 'continue': return continueFromTeams();
+      case 'continue': return act('toRoundIntro');
       case 'startRound': return act('startRound');
       case 'startTurn': return act('startTurn');
       case 'got': chime(); return act('got');
@@ -573,12 +499,10 @@
     }
   });
   app.addEventListener('change', (e) => { if (/^s_[wtsc]$/.test(e.target.id)) pushSettings(); });
-  app.addEventListener('input', (e) => { if (e.target.classList && e.target.classList.contains('tn')) teamDrafts[e.target.dataset.team] = e.target.value; });
   app.addEventListener('input', (e) => { if (e.target.id === 'jc') e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''); });
   app.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter') return;
     const t = e.target;
-    if (t.classList.contains('tn')) { e.preventDefault(); saveTeamName(parseInt(t.dataset.team, 10)); return; }
     if (t.id === 'hn') doCreate();
     else if (t.id === 'jn' || t.id === 'jc') doJoin(urlCode());
     else if (t.classList.contains('wi')) {

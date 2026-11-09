@@ -106,21 +106,7 @@ select{width:100%;padding:11px 12px;border-radius:10px;border:2px solid var(--li
 .team h3{margin:0 0 8px;font-size:18px}
 .team ul{list-style:none;margin:0;padding:0}
 .team li{padding:7px 10px;background:rgba(255,255,255,.2);border-radius:10px;margin-bottom:6px;font-weight:700}
-.team li{display:flex;align-items:center;gap:8px;justify-content:space-between}
 .team li.me{background:rgba(255,255,255,.42);outline:2px solid rgba(255,255,255,.8)}
-.team li.empty{background:transparent;border:2px dashed rgba(255,255,255,.55);color:rgba(255,255,255,.9);justify-content:center;font-weight:600}
-.pn{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.mv{display:flex;gap:6px;flex:none}
-.mvb{appearance:none;border:0;cursor:pointer;font:inherit;font-weight:800;font-size:13px;padding:7px 10px;border-radius:9px;background:rgba(255,255,255,.92);color:#10283a;min-height:34px}
-.mvb:hover{background:#fff}
-.mvb.x{background:rgba(0,0,0,.18);color:#fff;padding:7px 10px}
-.pool{margin-top:14px;background:#f5f9fc;border:2px dashed #b8d6e6;border-radius:16px;padding:12px 14px}
-.pool h3{margin:0 0 8px;font-size:15px}
-.pool ul{list-style:none;margin:0;padding:0}
-.pool li{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 0;font-weight:700;flex-wrap:wrap}
-.pool .mvb{color:#fff}
-.pool .mvb.c0{background:var(--coral)}
-.pool .mvb.c1{background:var(--sea)}
 
 .scorebar{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:stretch;max-width:760px;margin:6px auto 0}
 .sb{border-radius:16px;padding:10px 14px;color:#fff;display:flex;justify-content:space-between;align-items:center;font-weight:800}
@@ -191,13 +177,3 @@ dialog h2{margin-top:0}
 .how b{display:block;font-size:17px;margin-bottom:4px}
 .how span{color:#cfe8f4;font-size:14px;line-height:1.4}
 footer.foot{text-align:center;color:#a6cfe2;font-size:13px;margin-top:26px}
-
-/* team naming */
-.tn-row{display:flex;gap:6px;margin:0 0 4px}
-.tn-row .tn{flex:1;min-width:0;padding:9px 12px;font-size:16px;font-weight:700;border-radius:10px;border:2px solid rgba(255,255,255,.7);background:#fff;color:var(--ink)}
-.tn-row .tn:focus{border-color:#fff;box-shadow:0 0 0 3px rgba(255,255,255,.45)}
-.tn-row .mvb{background:#10283a;color:#fff}
-.tn-note{font-size:12px;font-weight:700;opacity:.95;margin:0 0 8px}
-.team h3{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.mvb{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.sb .nm{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

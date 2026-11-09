@@ -17,8 +17,7 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no I, O, 0, 1
-const DEFAULT_TEAM_NAMES = ['Team Coral', 'Team Seafoam'];
-const MAX_TEAM_NAME = 20;
+const TEAM_NAMES = ['Team Coral', 'Team Seafoam'];
 const ROUND_NAMES = ['Describe', 'Act it out', 'One word'];
 
 const rooms = new Map();
@@ -56,7 +55,6 @@ function createRoom() {
     touched: now(),
     hostId: null,
     phase: 'lobby', // lobby | writing | teams | roundIntro | playing | gameOver
-    teamNames: DEFAULT_TEAM_NAMES.slice(),
     settings: { wordsPerPlayer: 3, turnSeconds: 60, skips: 'unlimited', carryOver: true },
     players: [], // {id,name,team,words:[],submitted,conns:Set,connected,hostTimer}
     round: 0, // 1..3 once started
@@ -92,23 +90,6 @@ function ensureHost(room) {
   if (next) room.hostId = next.id;
 }
 
-/* ---------- team naming ----------
- * Who picks a team's name:
- *   - the host, for the team the host is on
- *   - for the other team: one person (the first connected member), so there is exactly one namer per team
- *   - if a team has nobody who can do it (empty / all offline) the host can name it
- */
-function namerOf(room, team) {
-  const host = byId(room, room.hostId);
-  if (host && host.team === team) return host;
-  return room.players.find((q) => q.team === team && q.connected) || null;
-}
-function canRename(room, p, team) {
-  if (room.phase !== 'teams') return false;
-  const namer = namerOf(room, team);
-  return namer ? namer.id === p.id : room.hostId === p.id;
-}
-
 /* ---------- view (personalised, so the secret card is only sent to the clue giver) ---------- */
 function skipsLeft(room, t) {
   const s = room.settings.skips;
@@ -128,9 +109,7 @@ function viewFor(room, p) {
     phase: room.phase,
     settings: room.settings,
     roundNames: ROUND_NAMES,
-    teamNames: room.teamNames,
-    canRename: [canRename(room, p, 0), canRename(room, p, 1)],
-    namers: [namerOf(room, 0), namerOf(room, 1)].map((q) => (q ? q.name : null)),
+    teamNames: TEAM_NAMES,
     me: { id: p.id, name: p.name, team: p.team, isHost: room.hostId === p.id, words: p.words, submitted: p.submitted },
     players: room.players.map((q) => ({
       id: q.id, name: q.name, team: q.team, connected: q.connected, submitted: q.submitted, isHost: room.hostId === q.id,
@@ -282,7 +261,6 @@ function resetToLobby(room) {
   room.lastTurn = null;
   room.carryMs = 0;
   room.pos = [0, 0];
-  room.teamNames = DEFAULT_TEAM_NAMES.slice();
   room.players = room.players.filter((p) => p.connected || room.hostId === p.id);
   for (const p of room.players) { p.words = []; p.submitted = false; p.team = null; }
 }
@@ -366,42 +344,8 @@ function handleAction(room, p, a) {
       assignTeams(room);
       return {};
     }
-    case 'setTeam': {
-      // Manual team selection: host moves one player to team 0 / team 1, or back to "unassigned" (null).
-      if (!isHost || room.phase !== 'teams') return fail('Only the host can do that.');
-      const q = byId(room, a.playerId);
-      if (!q) return fail('Unknown player.');
-      const team = a.team === null || a.team === 'none' ? null : parseInt(a.team, 10);
-      if (team !== null && team !== 0 && team !== 1) return fail('Unknown team.');
-      q.team = team;
-      return {};
-    }
-    case 'renameTeam': {
-      const team = parseInt(a.team, 10);
-      if (team !== 0 && team !== 1) return fail('Unknown team.');
-      if (room.phase !== 'teams') return fail('Team names can only be changed while teams are being set up.');
-      if (!canRename(room, p, team)) {
-        const nm = namerOf(room, team);
-        return fail(nm ? `Only ${nm.name} can name this team.` : 'Only the host can name this team.');
-      }
-      const name = clean(a.name, MAX_TEAM_NAME);
-      const final = name || DEFAULT_TEAM_NAMES[team]; // empty = back to default
-      if (room.teamNames[1 - team].toLowerCase() === final.toLowerCase()) return fail('The other team already uses that name.');
-      room.teamNames[team] = final;
-      return {};
-    }
-    case 'clearTeams': {
-      // Start from a blank slate so the host can pick every player by hand.
-      if (!isHost || room.phase !== 'teams') return fail('Only the host can do that.');
-      for (const q of room.players) q.team = null;
-      return {};
-    }
     case 'toRoundIntro': {
       if (!isHost || room.phase !== 'teams') return fail('Only the host can do that.');
-      const unassigned = room.players.filter((q) => q.team !== 0 && q.team !== 1);
-      if (unassigned.length) return fail(`Assign ${unassigned.length === 1 ? unassigned[0].name : unassigned.length + ' players'} to a team first.`);
-      if (!teamPlayers(room, 0).length || !teamPlayers(room, 1).length) return fail('Each team needs at least one player.');
-      room.pos = [0, 0];
       room.phase = 'roundIntro';
       room.round = 0;
       return {};
