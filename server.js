@@ -12,6 +12,8 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const MIN_PLAYERS = parseInt(process.env.MIN_PLAYERS || '4', 10);
 const MAX_PLAYERS = 30;
 const MAX_ROOMS = 500;
+// Only needed if the website is hosted on a different domain than this server (comma-separated list).
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no I, O, 0, 1
@@ -55,7 +57,6 @@ function createRoom() {
     hostId: null,
     phase: 'lobby', // lobby | writing | teams | roundIntro | playing | gameOver
     teamNames: DEFAULT_TEAM_NAMES.slice(),
-    namers: [null, null], // player id who may name each team (see "team naming" below)
     settings: { wordsPerPlayer: 3, turnSeconds: 60, skips: 'unlimited', carryOver: true },
     players: [], // {id,name,team,words:[],submitted,conns:Set,connected,hostTimer}
     round: 0, // 1..3 once started
@@ -75,7 +76,8 @@ function createRoom() {
 
 const byId = (room, id) => room.players.find((p) => p.id === id);
 const teamPlayers = (room, t) => room.players.filter((p) => p.team === t);
-const totals = (room) => [0, 1].map((t) => room.scores.reduce((s, r) => s + r[t], 0));
+const totalsOf = (scores) => [0, 1].map((t) => scores.reduce((s, r) => s + r[t], 0));
+const totals = (room) => totalsOf(room.scores);
 
 function addPlayer(room, name) {
   const p = { id: rid(), name, team: null, words: [], submitted: false, conns: new Set(), connected: false, hostTimer: null };
@@ -92,48 +94,23 @@ function ensureHost(room) {
 }
 
 /* ---------- team naming ----------
- * Naming opens once every player is on a team and both teams have someone.
- *   - the host names the team the host is on
- *   - ONE player picked at random from the opposite team names that team
- *   - if that random player is offline, the host may name that team instead
- * The random pick is made once and kept while that player stays on the team.
+ * Who picks a team's name:
+ *   - the host, for the team the host is on
+ *   - for the other team: one person (the first connected member), so there is exactly one namer per team
+ *   - if a team has nobody who can do it (empty / all offline) the host can name it
  */
-function teamsReady(room) {
-  return room.players.length > 0 && room.players.every((p) => p.team === 0 || p.team === 1) &&
-    teamPlayers(room, 0).length > 0 && teamPlayers(room, 1).length > 0;
-}
-function resolveNamers(room) {
-  if (!teamsReady(room)) return;
-  const host = byId(room, room.hostId);
-  for (const t of [0, 1]) {
-    if (host && host.team === t) { room.namers[t] = host.id; continue; }
-    const cur = byId(room, room.namers[t]);
-    if (cur && cur.team === t) continue;
-    const members = teamPlayers(room, t);
-    const live = members.filter((m) => m.connected);
-    const pool = live.length ? live : members;
-    room.namers[t] = pool[crypto.randomInt(pool.length)].id;
-  }
-}
 function namerOf(room, team) {
-  if (!teamsReady(room)) return null;
-  resolveNamers(room);
-  return byId(room, room.namers[team]) || null;
+  const host = byId(room, room.hostId);
+  if (host && host.team === team) return host;
+  return room.players.find((q) => q.team === team && q.connected) || null;
 }
 function canRename(room, p, team) {
-  if (room.phase !== 'teams' || !teamsReady(room)) return false;
+  if (room.phase !== 'teams') return false;
   const namer = namerOf(room, team);
-  if (!namer) return false;
-  if (namer.id === p.id) return true;
-  return room.hostId === p.id && !namer.connected; // host steps in only if the picked player is offline
-}
-function resetTeamNaming(room) {
-  room.teamNames = DEFAULT_TEAM_NAMES.slice();
-  room.namers = [null, null];
+  return namer ? namer.id === p.id : room.hostId === p.id;
 }
 
-/* ---------- view (personalised: the secret card goes only to the clue giver,
- * and the end-of-turn review list goes ONLY to the player whose turn just ended) ---------- */
+/* ---------- view (personalised, so the secret card is only sent to the clue giver) ---------- */
 function skipsLeft(room, t) {
   const s = room.settings.skips;
   if (s === 'unlimited') return -1;
@@ -141,10 +118,65 @@ function skipsLeft(room, t) {
   return Math.max(0, 1 - t.skipsUsed);
 }
 
+/* Who will give clues next (read-only peek – does not move the rotation). */
+function peekGiver(room, team) {
+  const list = teamPlayers(room, team);
+  if (!list.length) return null;
+  for (let i = 0; i < list.length; i++) {
+    const cand = list[(room.pos[team] + i) % list.length];
+    if (cand.connected) return cand;
+  }
+  return list[room.pos[team] % list.length];
+}
+
 function viewFor(room, p) {
   const t = room.turn;
   const isGiver = !!t && t.giverId === p.id;
+  // While the clue giver reviews their turn, NOBODY ELSE gets a review screen or any review data.
+  // They carry straight on to the next turn's "up next" screen (the next giver just can't start until the review is
+  // confirmed) and keep seeing the scores / cards-left exactly as they were when the turn ended.
+  const hidden = !!t && t.status === 'review' && !isGiver;
   const giver = t ? byId(room, t.giverId) : null;
+  let turnView = null;
+  if (t && !hidden) {
+    turnView = {
+      team: t.team,
+      giverId: t.giverId,
+      giverName: giver ? giver.name : '?',
+      giverConnected: giver ? giver.connected : false,
+      status: t.status,
+      durationMs: t.durationMs,
+      endsAt: t.endsAt,
+      guessedCount: t.seen.filter((c) => c.ok).length,
+      skipsLeft: skipsLeft(room, t),
+      reason: t.reason,
+      // every card that came up this turn, ticked if it counts as guessed – sent to the clue giver ONLY
+      review: isGiver && t.status === 'review' ? t.seen.map((c) => ({ id: c.id, text: c.text, ok: c.ok })) : undefined,
+    };
+  } else if (t && hidden) {
+    if (t.base.bowlLeft === 0) {
+      // that was the last card of the round – nothing to start yet
+      turnView = { team: t.team, giverId: null, giverName: '', giverConnected: true, status: 'wrap', durationMs: 0, endsAt: null,
+        guessedCount: 0, skipsLeft: -1, endReason: t.reason };
+    } else {
+      const team = 1 - t.team;
+      const next = peekGiver(room, team) || peekGiver(room, t.team);
+      turnView = {
+        team: next ? next.team : team,
+        giverId: next ? next.id : null,
+        giverName: next ? next.name : '?',
+        giverConnected: next ? next.connected : false,
+        status: 'ready',
+        holding: true, // the previous player is still finishing up, so Start is held for a moment
+        endReason: t.reason === 'time' ? 'time' : 'done', // only used for the buzzer – no review information
+        durationMs: room.settings.turnSeconds * 1000,
+        endsAt: null,
+        guessedCount: 0,
+        skipsLeft: -1,
+        canForce: room.hostId === p.id && !!giver && !giver.connected, // host fallback if the reviewer dropped off
+      };
+    }
+  }
   return {
     serverTime: now(),
     code: room.code,
@@ -153,7 +185,6 @@ function viewFor(room, p) {
     settings: room.settings,
     roundNames: ROUND_NAMES,
     teamNames: room.teamNames,
-    teamsReady: teamsReady(room),
     canRename: [canRename(room, p, 0), canRename(room, p, 1)],
     namers: [namerOf(room, 0), namerOf(room, 1)].map((q) => (q ? q.name : null)),
     me: { id: p.id, name: p.name, team: p.team, isHost: room.hostId === p.id, words: p.words, submitted: p.submitted },
@@ -161,28 +192,13 @@ function viewFor(room, p) {
       id: q.id, name: q.name, team: q.team, connected: q.connected, submitted: q.submitted, isHost: room.hostId === q.id,
     })),
     round: room.round,
-    scores: room.scores,
-    totals: totals(room),
-    bowlLeft: room.bowl.length + (t && t.current ? 1 : 0),
+    scores: hidden ? t.base.scores : room.scores,
+    totals: hidden ? totalsOf(t.base.scores) : totals(room),
+    bowlLeft: hidden ? t.base.bowlLeft : room.bowl.length + (t && t.current ? 1 : 0),
     totalCards: room.allCards.length,
     carryMs: room.carryMs,
     lastTurn: room.lastTurn,
-    turn: t
-      ? {
-          team: t.team,
-          giverId: t.giverId,
-          giverName: giver ? giver.name : '?',
-          giverConnected: giver ? giver.connected : false,
-          status: t.status,
-          durationMs: t.durationMs,
-          endsAt: t.endsAt,
-          guessedCount: t.seen.filter((c) => c.ok).length,
-          skipsLeft: skipsLeft(room, t),
-          reason: t.reason,
-          // every card that came up this turn, ticked if it counts as guessed – sent to the clue giver only
-          review: isGiver && t.status === 'review' ? t.seen.map((c) => ({ id: c.id, text: c.text, ok: c.ok })) : undefined,
-        }
-      : null,
+    turn: turnView,
     card: isGiver && t.status === 'active' && t.current ? t.current.text : null,
     guessedThisTurn: isGiver ? t.seen.filter((c) => c.ok).map((c) => c.text) : undefined,
   };
@@ -237,7 +253,7 @@ function noteSeen(t, card) {
 }
 
 /* Step 1: the turn is over (time ran out, giver ended it, or the bowl is empty).
- * Cards that were not guessed go back into the bowl; the clue giver lands on the review screen. */
+ * Cards that were not guessed go back into the bowl; ONLY the clue giver lands on the review screen. */
 function endTurnToReview(room, reason) {
   const t = room.turn;
   if (!t || t.status !== 'active') return;
@@ -248,6 +264,7 @@ function endTurnToReview(room, reason) {
     t.current = null;
   }
   t.reason = reason; // 'time' | 'done' | 'bowlEmpty'
+  t.base = { scores: room.scores.map((r) => r.slice()), bowlLeft: room.bowl.length }; // what others keep seeing meanwhile
   t.status = 'review';
 }
 
@@ -256,10 +273,7 @@ function confirmReview(room) {
   const t = room.turn;
   if (!t || t.status !== 'review') return;
   const giver = byId(room, t.giverId);
-  room.lastTurn = {
-    giverName: giver ? giver.name : '?', team: t.team, guessedCount: t.seen.filter((c) => c.ok).length,
-    reason: t.reason, round: room.round,
-  };
+  room.lastTurn = { giverName: giver ? giver.name : '?', team: t.team, guessedCount: t.seen.filter((c) => c.ok).length, reason: t.reason, round: room.round };
   if (room.bowl.length === 0) {
     room.carryMs = room.settings.carryOver && t.remainingMs > 3000 ? t.remainingMs : 0;
     room.carryTeam = t.team;
@@ -288,12 +302,10 @@ function startRound(room) {
   room.carryMs = 0;
 }
 
-/* random automatic distribution (used for the first draw and for "shuffle") */
 function assignTeams(room) {
   const ps = shuffle(room.players);
   ps.forEach((p, i) => (p.team = i % 2));
   room.pos = [0, 0];
-  resetTeamNaming(room);
 }
 
 function buildBowl(room) {
@@ -311,7 +323,7 @@ function resetToLobby(room) {
   room.lastTurn = null;
   room.carryMs = 0;
   room.pos = [0, 0];
-  resetTeamNaming(room);
+  room.teamNames = DEFAULT_TEAM_NAMES.slice();
   room.players = room.players.filter((p) => p.connected || room.hostId === p.id);
   for (const p of room.players) { p.words = []; p.submitted = false; p.team = null; }
 }
@@ -390,19 +402,13 @@ function handleAction(room, p, a) {
       room.phase = 'teams';
       return {};
     }
-    case 'reshuffleTeams': { // automatic distribution / reshuffle
+    case 'reshuffleTeams': {
       if (!isHost || room.phase !== 'teams') return fail('Only the host can do that.');
       assignTeams(room);
       return {};
     }
-    case 'clearTeams': { // start the manual distribution from a blank slate
-      if (!isHost || room.phase !== 'teams') return fail('Only the host can do that.');
-      for (const q of room.players) q.team = null;
-      resetTeamNaming(room);
-      return {};
-    }
     case 'setTeam': {
-      // Manual distribution: host puts one player on team 0 / team 1, or back to "not on a team" (null).
+      // Manual team selection: host moves one player to team 0 / team 1, or back to "unassigned" (null).
       if (!isHost || room.phase !== 'teams') return fail('Only the host can do that.');
       const q = byId(room, a.playerId);
       if (!q) return fail('Unknown player.');
@@ -415,14 +421,20 @@ function handleAction(room, p, a) {
       const team = parseInt(a.team, 10);
       if (team !== 0 && team !== 1) return fail('Unknown team.');
       if (room.phase !== 'teams') return fail('Team names can only be changed while teams are being set up.');
-      if (!teamsReady(room)) return fail('Put every player on a team first, then name the teams.');
       if (!canRename(room, p, team)) {
         const nm = namerOf(room, team);
-        return fail(nm ? `Only ${nm.name} can name this team.` : 'You can’t name this team.');
+        return fail(nm ? `Only ${nm.name} can name this team.` : 'Only the host can name this team.');
       }
-      const final = clean(a.name, MAX_TEAM_NAME) || DEFAULT_TEAM_NAMES[team]; // empty = back to default
+      const name = clean(a.name, MAX_TEAM_NAME);
+      const final = name || DEFAULT_TEAM_NAMES[team]; // empty = back to default
       if (room.teamNames[1 - team].toLowerCase() === final.toLowerCase()) return fail('The other team already uses that name.');
       room.teamNames[team] = final;
+      return {};
+    }
+    case 'clearTeams': {
+      // Start from a blank slate so the host can pick every player by hand.
+      if (!isHost || room.phase !== 'teams') return fail('Only the host can do that.');
+      for (const q of room.players) q.team = null;
       return {};
     }
     case 'toRoundIntro': {
@@ -441,6 +453,7 @@ function handleAction(room, p, a) {
       return {};
     }
     case 'startTurn': {
+      if (room.phase === 'playing' && t && t.status === 'review') return fail('One moment – the last turn is still being wrapped up.');
       if (room.phase !== 'playing' || !t || t.status !== 'ready') return fail('Not ready.');
       if (t.giverId !== p.id) return fail("It's not your turn.");
       t.status = 'active';
@@ -482,7 +495,7 @@ function handleAction(room, p, a) {
       return {};
     }
     case 'toggleCard': {
-      // Review screen (clue giver only): tick a card that was guessed but missed, or untick one counted by mistake.
+      // Review screen: tick a card that was guessed but missed, or untick one counted by mistake.
       if (room.phase !== 'playing' || !t || t.status !== 'review') return fail('Nothing to review.');
       if (t.giverId !== p.id) return fail('Only the player whose turn just ended can review the cards.');
       const e = t.seen.find((c) => c.id === a.cardId);
@@ -534,7 +547,7 @@ function handleAction(room, p, a) {
 /* ---------- HTTP ---------- */
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
-  '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json', '.webmanifest': 'application/manifest+json',
+  '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json',
 };
 const SECURITY = {
   'X-Content-Type-Options': 'nosniff',
@@ -555,7 +568,7 @@ function readBody(req) {
   });
 }
 function serveStatic(req, res, urlPath) {
-  let rel = urlPath === '/' || /^\/r\/[A-Za-z0-9]{4}\/?$/.test(urlPath) ? '/index.html' : urlPath;
+  const rel = urlPath === '/' || /^\/r\/[A-Za-z0-9]{4}\/?$/.test(urlPath) ? '/index.html' : urlPath;
   const file = path.normalize(path.join(PUBLIC_DIR, rel));
   if (!file.startsWith(PUBLIC_DIR)) { res.writeHead(403); return res.end('Forbidden'); }
   fs.readFile(file, (err, buf) => {
@@ -570,6 +583,18 @@ function serveStatic(req, res, urlPath) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const p = url.pathname;
+  // CORS (only matters if the website is served from a different domain than this server)
+  const origin = req.headers.origin;
+  if (origin) {
+    const ok = ALLOWED_ORIGIN === '*' || ALLOWED_ORIGIN.split(',').map((x) => x.trim().replace(/\/$/, '')).includes(origin);
+    if (ok) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    }
+  }
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
   try {
     if (p === '/healthz') return sendJSON(res, 200, { ok: true, rooms: rooms.size });
 
@@ -589,8 +614,7 @@ const server = http.createServer(async (req, res) => {
       const code = clean(b.code, 8).toUpperCase();
       const room = rooms.get(code);
       if (!room) return sendJSON(res, 404, fail("We couldn't find that game. Check the code and try again."));
-      // reconnect
-      if (b.pid) {
+      if (b.pid) { // reconnect
         const ex = byId(room, String(b.pid));
         if (ex) return sendJSON(res, 200, { code, pid: ex.id });
       }

@@ -1,6 +1,7 @@
 /* Fishbowl client – vanilla JS, no build step. */
 (() => {
   'use strict';
+  const API = (window.FISHBOWL_API || '').replace(/\/+$/, '');
   const $ = (s, r = document) => r.querySelector(s);
   const app = $('#app');
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -24,7 +25,7 @@
   let audioCtx = null;
   let lastBeepSec = null;
   let prevTurnSig = '';
-  const teamDrafts = {};   // unsaved team-name text per team, so a live refresh never wipes what you're typing
+  const teamDrafts = {}; // unsaved team-name text per team, so a live refresh never wipes what you're typing
 
   /* ---------- storage ---------- */
   function loadSession() { try { return JSON.parse(localStorage.getItem('fb_session') || 'null'); } catch { return null; } }
@@ -56,7 +57,7 @@
     clearTimeout(toastT); toastT = setTimeout(() => (t.className = 'toast'), 2800);
   }
   async function post(path, body) {
-    const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const r = await fetch(API + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     let j = {}; try { j = await r.json(); } catch { /* */ }
     if (!r.ok) throw new Error(j.error || 'Something went wrong.');
     return j;
@@ -74,7 +75,7 @@
   /* ---------- connection ---------- */
   function connect() {
     if (es) es.close();
-    es = new EventSource(`/api/events?code=${session.code}&pid=${session.pid}`);
+    es = new EventSource(`${API}/api/events?code=${session.code}&pid=${session.pid}`);
     es.addEventListener('state', (e) => {
       const st = JSON.parse(e.data);
       offset = st.serverTime - Date.now();
@@ -104,15 +105,14 @@
   }
 
   function onState() {
-    // personal alerts
     const t = S.turn;
-    const sig = t ? `${S.round}:${t.giverId}:${t.status}:${t.endsAt}` : '';
+    const sig = t ? `${S.round}:${t.giverId}:${t.status}:${t.endsAt}:${t.holding ? 1 : 0}` : '';
     if (sig !== prevTurnSig) {
-      if (t && t.status === 'ready' && t.giverId === S.me.id) { chime(); if (navigator.vibrate) navigator.vibrate(200); }
-      if (t && t.status === 'review') {
-        if (t.reason === 'time') buzzer();
-        if (navigator.vibrate && t.giverId === S.me.id) navigator.vibrate([120, 80, 120]);
-      }
+      // "you're up" chime – only once the previous player has finished, so Start is actually available
+      if (t && t.status === 'ready' && !t.holding && t.giverId === S.me.id) { chime(); if (navigator.vibrate) navigator.vibrate(200); }
+      // time ran out: the clue giver (review screen) and everyone else (next-turn screen) all hear the buzzer
+      if (t && ((t.status === 'review' && t.reason === 'time') || ((t.holding || t.status === 'wrap') && t.endReason === 'time'))) buzzer();
+      if (t && t.status === 'review' && navigator.vibrate && t.giverId === S.me.id) navigator.vibrate([120, 80, 120]);
       prevTurnSig = sig; lastBeepSec = null;
     }
     if (location.pathname !== `/r/${S.code}`) history.replaceState(null, '', `/r/${S.code}`);
@@ -166,9 +166,10 @@
       <footer class="foot">4+ players · play on a video call · no sign-up needed</footer>`;
   }
 
+  const WAKE = 'Connecting to the game server… if it was asleep this can take up to a minute. Please wait.';
   async function doCreate() {
     const name = $('#hn').value.trim(); if (!name) return setErr('Please enter your name.');
-    localStorage.setItem('fb_name', name);
+    localStorage.setItem('fb_name', name); setErr(WAKE, true);
     try { const r = await post('/api/create', { name }); saveSession({ code: r.code, pid: r.pid }); connect(); }
     catch (e) { setErr(e.message); }
   }
@@ -177,11 +178,11 @@
     const code = (codeFromBtn || ($('#jc') ? $('#jc').value : '')).trim().toUpperCase();
     if (code.length !== 4) return setErr('Enter the 4-character game code.');
     if (!name) return setErr('Please enter your name.');
-    localStorage.setItem('fb_name', name);
+    localStorage.setItem('fb_name', name); setErr(WAKE, true);
     try { const r = await post('/api/join', { code, name }); saveSession({ code: r.code, pid: r.pid }); connect(); }
     catch (e) { setErr(e.message); }
   }
-  function setErr(m) { const e = $('#err'); if (e) e.textContent = m; else toast(m, true); }
+  function setErr(m, info) { const e = $('#err'); if (e) { e.textContent = m; e.classList.toggle('info', !!info); } else toast(m, !info); }
 
   /* ---------- shared bits ---------- */
   const playersList = (withKick) => `<ul class="players">${S.players.map((p) => `
@@ -274,9 +275,8 @@
     view('writing:' + me.submitted + ':' + n, html, () => {
       const done = S.players.filter((p) => p.submitted).length;
       const ws = $('#wstatus');
-      if (ws) ws.innerHTML = `<div class="muted small" style="font-weight:700">${done} of ${S.players.length} players ready</div>` + playersList(false).replace(/<li>/g, '<li>').replace(/(<span class="nm">[^<]*<\/span>)/g, '$1');
       if (ws) {
-        // add ready/writing tags
+        ws.innerHTML = `<div class="muted small" style="font-weight:700">${done} of ${S.players.length} players ready</div>` + playersList(false);
         const items = ws.querySelectorAll('li');
         S.players.forEach((p, i) => { if (items[i]) items[i].insertAdjacentHTML('beforeend', p.submitted ? '<span class="tag ok">ready</span>' : '<span class="tag">writing…</span>'); });
       }
@@ -296,7 +296,7 @@
     act('submitWords', { words });
   }
 
-  /* ---------- teams: automatic draw, shuffle, manual distribution, team names ---------- */
+  /* ---------- teams ---------- */
   async function saveTeamName(team) {
     const input = $(`.tn[data-team="${team}"]`);
     const name = input ? input.value : (teamDrafts[team] || '');
@@ -304,17 +304,10 @@
     if (ok) { delete teamDrafts[team]; toast('Team name saved!'); }
     return ok;
   }
-  async function continueFromTeams() {
-    // don't lose a name that was typed but not saved yet
-    for (const t of [0, 1]) {
-      if (teamDrafts[t] !== undefined && S.canRename[t]) { if (!(await saveTeamName(t))) return; }
-    }
-    return act('toRoundIntro');
-  }
 
   function renderTeams() {
     const host = S.me.isHost; const mine = S.me.team;
-    // remember typing + focus so a live refresh never disturbs what someone is typing
+    // remember typing + focus so the screen can refresh without disturbing it
     const ae = document.activeElement;
     const focus = ae && ae.classList && ae.classList.contains('tn') ? { team: ae.dataset.team, a: ae.selectionStart, b: ae.selectionEnd } : null;
     document.querySelectorAll('.tn').forEach((el) => {
@@ -325,13 +318,13 @@
     const inTeam = (t) => S.players.filter((p) => p.team === t);
     const pool = S.players.filter((p) => p.team !== 0 && p.team !== 1);
     const n0 = inTeam(0).length; const n1 = inTeam(1).length;
+    const short = (t) => teamName(t);
     const row = (p, t) => `<li class="${p.id === S.me.id ? 'me' : ''}">
-        <span class="pn">${esc(p.name)}${p.id === S.me.id ? ' (you)' : ''}${p.isHost ? ' ⭐' : ''}${!p.connected ? ' <small>(offline)</small>' : ''}</span>
-        ${host ? `<span class="mv"><button type="button" class="mvb" data-act="setTeam" data-id="${esc(p.id)}" data-team="${1 - t}" title="Move to ${esc(teamName(1 - t))}">→ ${esc(teamName(1 - t))}</button>
-          <button type="button" class="mvb x" data-act="setTeam" data-id="${esc(p.id)}" data-team="none" title="Take off the team" aria-label="Take ${esc(p.name)} off the team">✕</button></span>` : ''}
+        <span class="pn">${esc(p.name)}${p.id === S.me.id ? ' (you)' : ''}${!p.connected ? ' <small>(offline)</small>' : ''}</span>
+        ${host ? `<span class="mv"><button type="button" class="mvb" data-act="setTeam" data-id="${esc(p.id)}" data-team="${1 - t}" title="Move to ${esc(short(1 - t))}">→ ${esc(short(1 - t))}</button>
+          <button type="button" class="mvb x" data-act="setTeam" data-id="${esc(p.id)}" data-team="none" title="Unassign" aria-label="Unassign ${esc(p.name)}">✕</button></span>` : ''}
       </li>`;
     const nameBox = (t) => {
-      if (!S.teamsReady) return '';
       if (S.canRename[t]) {
         const val = teamDrafts[t] !== undefined ? teamDrafts[t] : S.teamNames[t];
         return `<div class="tn-row"><input class="tn" data-team="${t}" type="text" maxlength="20" value="${esc(val)}" placeholder="Team name" aria-label="Name for this team" autocomplete="off">
@@ -345,7 +338,7 @@
     const poolHtml = pool.length ? `
       <div class="pool">
         <h3>Not on a team yet (${pool.length})</h3>
-        <ul>${pool.map((p) => `<li><span class="pn">${esc(p.name)}${p.id === S.me.id ? ' (you)' : ''}${p.isHost ? ' ⭐' : ''}</span>
+        <ul>${pool.map((p) => `<li><span class="pn">${esc(p.name)}${p.id === S.me.id ? ' (you)' : ''}</span>
           ${host ? `<span class="mv"><button type="button" class="mvb c0" data-act="setTeam" data-id="${esc(p.id)}" data-team="0">${esc(teamName(0))}</button>
             <button type="button" class="mvb c1" data-act="setTeam" data-id="${esc(p.id)}" data-team="1">${esc(teamName(1))}</button></span>` : ''}</li>`).join('')}</ul>
       </div>` : '';
@@ -357,20 +350,11 @@
     const you = mine === 0 || mine === 1
       ? `You’re on <b style="color:${colorFor(mine)}">${esc(teamName(mine))}</b>.`
       : 'You’re not on a team yet.';
-    // who names what
-    let tip = '';
-    if (S.teamsReady) {
-      const mineToName = [0, 1].filter((t) => S.canRename[t]);
-      if (mineToName.length && !host) tip = `<div class="naming-tip you">🎲 You were picked to choose the name for ${esc(teamName(mineToName[0]))} – type it below and tap Save!</div>`;
-      else if (host) tip = '<div class="naming-tip">✎ You name your own team. One random player on the other team names theirs.</div>';
-      else tip = `<div class="naming-tip">✎ ${esc(S.namers[mine] || 'Someone')} is choosing your team’s name.</div>`;
-    }
     view(null, `
       <div class="card wide">
         <h2 class="center">${host ? 'Set up the teams' : 'Meet the teams!'}</h2>
         <p class="center muted" style="margin-top:0">${S.totalCards} cards are in the bowl. ${you}</p>
-        ${host ? '<p class="center muted small" style="margin:0 0 12px">Shuffle randomly, or build the teams yourself: tap a player’s button to put them on a team, or move them across.</p>' : ''}
-        ${tip}
+        ${host ? '<p class="center muted small" style="margin:0 0 12px">Shuffle randomly, or tap a player’s button to move them between teams. You name your team; one player on the other team names theirs.</p>' : ''}
         <div class="teams">${col(0)}${col(1)}</div>
         ${poolHtml}
         <div class="stack" style="margin-top:18px">
@@ -380,8 +364,7 @@
             <div class="row" style="gap:10px">
               <button class="btn ghost" style="flex:1" data-act="reshuffle">🔀 Shuffle randomly</button>
               <button class="btn ghost" style="flex:1" data-act="clearTeams">✋ Pick manually</button>
-            </div>
-            <div class="center muted small">Shuffling or starting over resets the team names.</div>`
+            </div>`
             : '<div class="center muted" style="font-weight:600">Waiting for the host to finalise the teams…</div>'}
         </div>
       </div>`);
@@ -389,6 +372,14 @@
       const el = $(`.tn[data-team="${focus.team}"]`);
       if (el) { el.focus(); try { el.setSelectionRange(focus.a, focus.b); } catch { /* */ } }
     }
+  }
+
+  async function continueFromTeams() {
+    // don't lose a name that was typed but not saved yet
+    for (const t of [0, 1]) {
+      if (teamDrafts[t] !== undefined && S.canRename[t]) { if (!(await saveTeamName(t))) return; }
+    }
+    return act('toRoundIntro');
   }
 
   /* ---------- round intro ---------- */
@@ -415,30 +406,15 @@
       </div>`);
   }
 
-  /* ---------- end-of-turn review: ONLY the player whose turn just ended sees the cards ---------- */
+  /* ---------- end-of-turn review: ONLY the player whose turn just ended ever gets this screen ---------- */
   function renderReview() {
-    const t = S.turn; const me = S.me;
-    const isGiver = t.giverId === me.id;
-    const reasonText = t.reason === 'time' ? 'Time’s up!' : t.reason === 'bowlEmpty' ? 'The bowl is empty!' : 'Turn ended';
-    const reasonIcon = t.reason === 'time' ? '⏰' : t.reason === 'bowlEmpty' ? '🎉' : '🏁';
-
-    if (!isGiver) {
-      // everyone else: no card list, just a waiting screen
-      view(null, scorebar() + `
-        <div class="card wide center">
-          <div class="big-emoji" style="font-size:44px">${reasonIcon}</div>
-          <h2 style="margin:6px 0 0">${reasonText}</h2>
-          <p class="muted" style="font-weight:600;margin:8px 0 0">${esc(t.giverName)} (<span style="color:${colorFor(t.team)}">${esc(teamName(t.team))}</span>) is reviewing their cards…</p>
-          <p class="muted small" style="margin:6px 0 0">The next turn starts as soon as they confirm.</p>
-          ${me.isHost && !t.giverConnected ? `<p style="margin:16px 0 0"><button class="btn ghost small" data-act="confirmReview">${esc(t.giverName)} is offline – continue without review</button></p>` : ''}
-        </div>`);
-      return;
-    }
-
+    const t = S.turn;
     const list = t.review || [];
     const n = list.filter((c) => c.ok).length;
-    const lastCard = S.bowlLeft === 0;
-    const confirmLabel = lastCard ? (S.round >= 3 ? 'Confirm & see results' : `Confirm & finish round ${S.round}`) : 'Confirm & next turn';
+    const reasonText = t.reason === 'time' ? 'Time’s up!' : t.reason === 'bowlEmpty' ? 'The bowl is empty!' : 'Turn ended';
+    const reasonIcon = t.reason === 'time' ? '⏰' : t.reason === 'bowlEmpty' ? '🎉' : '🏁';
+    const lastRound = S.bowlLeft === 0;
+    const confirmLabel = lastRound ? (S.round >= 3 ? 'Confirm & see results' : `Confirm & finish round ${S.round}`) : 'Confirm & next turn';
     const rows = list.map((c) => `<li><button type="button" class="rv-item ${c.ok ? 'on' : ''}" data-act="toggle" data-id="${c.id}" aria-pressed="${c.ok}">
         <span class="box">✓</span><span class="txt">${esc(c.text)}</span><span class="st">${c.ok ? 'Guessed' : 'Not guessed'}</span></button></li>`).join('');
     const y = window.scrollY;
@@ -460,7 +436,16 @@
   /* ---------- playing ---------- */
   function renderPlaying() {
     const t = S.turn; const r = RULES[S.round - 1]; const me = S.me;
-    if (t.status === 'review') return renderReview();
+    if (t.status === 'review') return renderReview();   // only ever sent to the player whose turn just ended
+    if (t.status === 'wrap') {
+      view(null, scorebar() + `
+        <div class="card wide center">
+          <div style="font-size:44px">🎉</div>
+          <h2 style="margin:6px 0 0">That was the last card!</h2>
+          <p class="muted" style="font-weight:600;margin:8px 0 0">Getting the round results ready…</p>
+        </div>`);
+      return;
+    }
     const isGiver = t.giverId === me.id;
     const sameTeam = me.team === t.team;
     let body = '';
@@ -474,7 +459,9 @@
           <div class="big-name" style="color:${colorFor(t.team)}">${esc(teamName(t.team))}</div>
           <p style="margin:10px 0"><span class="ruleflag">${r.icon} ${esc(r.name)}</span></p>
           <p class="muted" style="margin:0 0 16px">${esc(r.short)}<br>You have ${secs} seconds – ${S.bowlLeft} card${S.bowlLeft === 1 ? '' : 's'} left in the bowl.</p>
-          <button class="btn big block" data-act="startTurn">Start my turn</button>${lastLine}</div>`;
+          ${t.holding
+            ? '<button class="btn big block" disabled>Almost ready…</button>'
+            : '<button class="btn big block" data-act="startTurn">Start my turn</button>'}${lastLine}</div>`;
       } else {
         body = `<div class="card wide center">
           <div class="muted small" style="font-weight:800;letter-spacing:1px">UP NEXT</div>
@@ -483,7 +470,8 @@
           <p style="margin:10px 0"><span class="ruleflag">${r.icon} ${esc(r.name)}</span></p>
           <p class="muted" style="margin:0">${sameTeam ? 'Get ready to guess!' : 'Watch closely – make sure they follow the rules!'}<br>${secs} seconds · ${S.bowlLeft} card${S.bowlLeft === 1 ? '' : 's'} left in the bowl.</p>
           ${!t.giverConnected ? '<p class="err">This player appears to be offline.</p>' : ''}
-          ${me.isHost ? `<p style="margin:14px 0 0"><button class="btn ghost small" data-act="skipGiver">Skip ${esc(t.giverName)}’s turn</button></p>` : ''}
+          ${me.isHost && !t.holding ? `<p style="margin:14px 0 0"><button class="btn ghost small" data-act="skipGiver">Skip ${esc(t.giverName)}’s turn</button></p>` : ''}
+          ${me.isHost && t.holding && t.canForce ? `<p style="margin:14px 0 0"><button class="btn ghost small" data-act="confirmReview">The previous player is offline – continue</button></p>` : ''}
           ${lastLine}</div>`;
       }
     } else {
@@ -586,10 +574,8 @@
     }
   });
   app.addEventListener('change', (e) => { if (/^s_[wtsc]$/.test(e.target.id)) pushSettings(); });
-  app.addEventListener('input', (e) => {
-    if (e.target.classList && e.target.classList.contains('tn')) teamDrafts[e.target.dataset.team] = e.target.value;
-    if (e.target.id === 'jc') e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
-  });
+  app.addEventListener('input', (e) => { if (e.target.classList && e.target.classList.contains('tn')) teamDrafts[e.target.dataset.team] = e.target.value; });
+  app.addEventListener('input', (e) => { if (e.target.id === 'jc') e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''); });
   app.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter') return;
     const t = e.target;
@@ -610,5 +596,6 @@
       catch { saveSession(null); }
     }
     renderLanding();
+    if (API) fetch(API + '/healthz').catch(() => {}); // wake a sleeping backend while the user types
   })();
 })();

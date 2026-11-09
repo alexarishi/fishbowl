@@ -19,9 +19,15 @@ async function start(names, opts) {
   assert.equal(g.state.turn.status, 'review');
   const rv = g.state.turn.review; assert(rv.length >= 3); assert.equal(rv.filter((c) => c.ok).length, 2);
   // PRIVACY: nobody else receives the list – not in state, and not a single card word anywhere in their payload
+  const nextTeam = 1 - team; const baseScore = cs[0].state.scores[0].slice();
   for (const o of others) {
-    assert.equal(o.state.turn.status, 'review', 'others know a review is happening');
+    // nobody else gets a review screen at all: they are already on the NEXT turn's "up next" screen
+    assert.notEqual(o.state.turn.status, 'review', o.name + ' must not be sent a review state');
+    assert.equal(o.state.turn.status, 'ready'); assert.equal(o.state.turn.holding, true);
+    assert.equal(o.state.turn.team, nextTeam, o.name + ' sees the other team up next');
     assert.equal(o.state.turn.review, undefined, o.name + ' must not get the review list');
+    assert.equal(o.state.turn.reason, undefined, o.name + ' gets no review reason field');
+    assert(!/review/i.test(JSON.stringify(o.state.turn)), o.name + ' turn payload mentions nothing about review');
     assert.equal(o.state.card, null); assert.equal(o.state.guessedThisTurn, undefined);
     const st = JSON.parse(o.raw); delete st.me.words; const rest = JSON.stringify(st); // a player's own written cards are theirs to see
     for (const c of rv) assert(!rest.includes(c.text), `${o.name} payload leaked "${c.text}"`);
@@ -33,15 +39,23 @@ async function start(names, opts) {
     assert(!(await o.act('toggleCard', { cardId: rv[0].id })).ok, o.name + ' cannot toggle');
     assert(!(await o.act('confirmReview')).ok, o.name + ' cannot confirm');
   }
+  // the next giver cannot start while the review is open
+  const nextG = cs.find((c) => c.pid === others[0].state.turn.giverId);
+  assert(!(await nextG.act('startTurn')).ok, 'next giver must wait for the review to be confirmed');
   const missed = rv.find((c) => !c.ok);
   assert((await g.act('toggleCard', { cardId: missed.id })).ok);              // tick a missed card
-  assert.equal(roundScore(cs)[team], 3); assert.equal(cs[0].state.bowlLeft, 9);
+  assert.equal(g.state.scores[0][team], 3); assert.equal(g.state.bowlLeft, 9);
+  // ...and while the giver edits, everyone else keeps seeing the scores / cards-left from when the turn ended
+  for (const o of others) { assert.deepEqual(o.state.scores[0], baseScore, o.name + ' must not see review edits in the score'); assert.equal(o.state.bowlLeft, 10); }
   const wrong = rv.find((c) => c.ok);
   assert((await g.act('toggleCard', { cardId: wrong.id })).ok);                // untick one counted by mistake
-  assert.equal(roundScore(cs)[team], 2); assert.equal(cs[0].state.bowlLeft, 10);
+  assert.equal(g.state.scores[0][team], 2); assert.equal(g.state.bowlLeft, 10);
   assert(!(await g.act('startTurn')).ok, 'next turn must wait for confirmation');
   assert((await g.act('confirmReview')).ok);
   assert.equal(cs[0].state.turn.status, 'ready'); assert.notEqual(cs[0].state.turn.team, team);
+  for (const o of others) { assert.equal(o.state.turn.holding, undefined, 'held flag cleared'); assert.equal(o.state.scores[0][team], 2, 'scores update for everyone once confirmed'); }
+  assert.equal(nextG.state.turn.giverId, nextG.pid, 'same player who was shown up next');
+  assert((await nextG.act('startTurn')).ok, 'next giver can start after confirm');
   assert.equal(cs[0].state.lastTurn.guessedCount, 2); assert.equal(cs[0].state.lastTurn.guessed, undefined, 'no word list in lastTurn');
   console.log('1 review is private to the clue giver; tick/untick/confirm ok');
 
@@ -50,6 +64,7 @@ async function start(names, opts) {
   g = giverOf(cs); await g.act('startTurn'); const hand = g.state.card;
   await sleep(30400);
   assert.equal(g.state.turn.status, 'review'); assert.equal(g.state.turn.reason, 'time');
+  for (const o of cs.filter((c) => c !== g)) { assert.equal(o.state.turn.status, 'ready'); assert.equal(o.state.turn.holding, true); assert.equal(o.state.turn.endReason, 'time'); assert.equal(o.state.turn.review, undefined); }
   assert(!(await g.act('got')).ok);
   const late = g.state.turn.review.find((c) => c.text === hand); assert(late && !late.ok);
   assert((await g.act('toggleCard', { cardId: late.id })).ok);
@@ -68,7 +83,8 @@ async function start(names, opts) {
     await cur.act('startTurn'); await cur.act('endTurn');
     assert(!(await host.act('confirmReview')).ok, 'host cannot skip review while giver is online');
     cur.ac.abort(); await sleep(200);
-    assert.equal(host.state.turn.giverConnected, false);
+    assert.equal(host.state.turn.canForce, true, 'host is told the previous player is offline');
+    assert.equal(cs[2].state.turn.canForce === undefined || cs.filter((c) => c !== host && c !== cur).every((c) => !c.state.turn.canForce), true, 'only the host gets the fallback');
     assert((await host.act('confirmReview')).ok, 'host may continue if giver dropped');
     assert.equal(host.state.turn.status, 'ready');
     console.log('3 host fallback only when giver offline ok');
@@ -77,9 +93,10 @@ async function start(names, opts) {
   /* 4. bowl empties -> review; unticking keeps the round alive; then round ends */
   cs = await start(four);
   g = giverOf(cs); await g.act('startTurn'); while (g.state.turn.status === 'active') await g.act('got');
-  assert.equal(g.state.turn.reason, 'bowlEmpty'); assert.equal(cs[0].state.bowlLeft, 0);
+  assert.equal(g.state.turn.reason, 'bowlEmpty'); assert.equal(g.state.bowlLeft, 0);
+  for (const o of cs.filter((c) => c !== g)) { assert.equal(o.state.turn.status, 'wrap', 'others see a neutral "last card" screen'); assert.equal(o.state.turn.review, undefined); }
   const lastOne = g.state.turn.review[g.state.turn.review.length - 1];
-  await g.act('toggleCard', { cardId: lastOne.id }); assert.equal(cs[0].state.bowlLeft, 1);
+  await g.act('toggleCard', { cardId: lastOne.id }); assert.equal(g.state.bowlLeft, 1);
   await g.act('confirmReview'); assert.equal(cs[0].state.phase, 'playing');
   g = giverOf(cs); await g.act('startTurn'); await g.act('got'); await g.act('confirmReview');
   assert.equal(cs[0].state.phase, 'roundIntro'); const r1 = roundScore(cs); assert.equal(r1[0] + r1[1], 12);
