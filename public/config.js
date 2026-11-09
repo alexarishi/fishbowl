@@ -1,4 +1,3 @@
 // Where the game server lives.
-//  - Leave '' if the same server also serves this site (Render-only / VPS / Docker setup).
-//  - On Netlify, set it to your backend URL, e.g. 'https://fishbowl-xxxx.onrender.com' (no trailing slash).
+// Leave '' when one Render service serves both the website and the game (the normal setup).
 window.FISHBOWL_API = '';

@@ -25,6 +25,7 @@
   let audioCtx = null;
   let lastBeepSec = null;
   let prevTurnSig = '';
+  const teamDrafts = {}; // unsaved team-name text per team, so a live refresh never wipes what you're typing
 
   /* ---------- storage ---------- */
   function loadSession() { try { return JSON.parse(localStorage.getItem('fb_session') || 'null'); } catch { return null; } }
@@ -62,8 +63,8 @@
     return j;
   }
   async function act(type, extra = {}) {
-    try { await post('/api/action', { code: session.code, pid: session.pid, type, ...extra }); }
-    catch (e) { toast(e.message, true); }
+    try { await post('/api/action', { code: session.code, pid: session.pid, type, ...extra }); return true; }
+    catch (e) { toast(e.message, true); return false; }
   }
   const initials = (n) => (n || '?').trim().slice(0, 1).toUpperCase();
   const teamName = (t) => (t == null ? '' : S.teamNames[t]);
@@ -104,14 +105,15 @@
   }
 
   function onState() {
-    // personal alerts
     const t = S.turn;
     const sig = t ? `${S.round}:${t.giverId}:${t.status}:${t.endsAt}` : '';
     if (sig !== prevTurnSig) {
       if (t && t.status === 'ready' && t.giverId === S.me.id) { chime(); if (navigator.vibrate) navigator.vibrate(200); }
+      if (t && t.status === 'review') { if (t.reason === 'time') buzzer(); if (navigator.vibrate && t.giverId === S.me.id) navigator.vibrate([120, 80, 120]); }
       prevTurnSig = sig; lastBeepSec = null;
     }
     if (location.pathname !== `/r/${S.code}`) history.replaceState(null, '', `/r/${S.code}`);
+    if (S.phase !== 'teams') { delete teamDrafts[0]; delete teamDrafts[1]; }
     switch (S.phase) {
       case 'lobby': return renderLobby();
       case 'writing': return renderWriting();
@@ -164,7 +166,7 @@
   const WAKE = 'Connecting to the game server… if it was asleep this can take up to a minute. Please wait.';
   async function doCreate() {
     const name = $('#hn').value.trim(); if (!name) return setErr('Please enter your name.');
-    localStorage.setItem('fb_name', name); setErr(WAKE);
+    localStorage.setItem('fb_name', name); setErr(WAKE, true);
     try { const r = await post('/api/create', { name }); saveSession({ code: r.code, pid: r.pid }); connect(); }
     catch (e) { setErr(e.message); }
   }
@@ -173,11 +175,11 @@
     const code = (codeFromBtn || ($('#jc') ? $('#jc').value : '')).trim().toUpperCase();
     if (code.length !== 4) return setErr('Enter the 4-character game code.');
     if (!name) return setErr('Please enter your name.');
-    localStorage.setItem('fb_name', name); setErr(WAKE);
+    localStorage.setItem('fb_name', name); setErr(WAKE, true);
     try { const r = await post('/api/join', { code, name }); saveSession({ code: r.code, pid: r.pid }); connect(); }
     catch (e) { setErr(e.message); }
   }
-  function setErr(m) { const e = $('#err'); if (e) e.textContent = m; else toast(m, true); }
+  function setErr(m, info) { const e = $('#err'); if (e) { e.textContent = m; e.classList.toggle('info', !!info); } else toast(m, !info); }
 
   /* ---------- shared bits ---------- */
   const playersList = (withKick) => `<ul class="players">${S.players.map((p) => `
@@ -270,9 +272,8 @@
     view('writing:' + me.submitted + ':' + n, html, () => {
       const done = S.players.filter((p) => p.submitted).length;
       const ws = $('#wstatus');
-      if (ws) ws.innerHTML = `<div class="muted small" style="font-weight:700">${done} of ${S.players.length} players ready</div>` + playersList(false).replace(/<li>/g, '<li>').replace(/(<span class="nm">[^<]*<\/span>)/g, '$1');
       if (ws) {
-        // add ready/writing tags
+        ws.innerHTML = `<div class="muted small" style="font-weight:700">${done} of ${S.players.length} players ready</div>` + playersList(false);
         const items = ws.querySelectorAll('li');
         S.players.forEach((p, i) => { if (items[i]) items[i].insertAdjacentHTML('beforeend', p.submitted ? '<span class="tag ok">ready</span>' : '<span class="tag">writing…</span>'); });
       }
@@ -293,20 +294,89 @@
   }
 
   /* ---------- teams ---------- */
+  async function saveTeamName(team) {
+    const input = $(`.tn[data-team="${team}"]`);
+    const name = input ? input.value : (teamDrafts[team] || '');
+    const ok = await act('renameTeam', { team, name });
+    if (ok) { delete teamDrafts[team]; toast('Team name saved!'); }
+    return ok;
+  }
+
   function renderTeams() {
-    const mine = S.me.team;
-    const col = (t) => `<div class="team t${t}"><h3>${esc(teamName(t))} (${S.players.filter((p) => p.team === t).length})</h3><ul>${
-      S.players.filter((p) => p.team === t).map((p) => `<li class="${p.id === S.me.id ? 'me' : ''}">${esc(p.name)}${p.id === S.me.id ? ' (you)' : ''}</li>`).join('')}</ul></div>`;
+    const host = S.me.isHost; const mine = S.me.team;
+    // remember typing + focus so the screen can refresh without disturbing it
+    const ae = document.activeElement;
+    const focus = ae && ae.classList && ae.classList.contains('tn') ? { team: ae.dataset.team, a: ae.selectionStart, b: ae.selectionEnd } : null;
+    document.querySelectorAll('.tn').forEach((el) => {
+      const t = el.dataset.team;
+      if (el.value !== (S.teamNames[t] || '')) teamDrafts[t] = el.value; else delete teamDrafts[t];
+    });
+
+    const inTeam = (t) => S.players.filter((p) => p.team === t);
+    const pool = S.players.filter((p) => p.team !== 0 && p.team !== 1);
+    const n0 = inTeam(0).length; const n1 = inTeam(1).length;
+    const short = (t) => teamName(t);
+    const row = (p, t) => `<li class="${p.id === S.me.id ? 'me' : ''}">
+        <span class="pn">${esc(p.name)}${p.id === S.me.id ? ' (you)' : ''}${!p.connected ? ' <small>(offline)</small>' : ''}</span>
+        ${host ? `<span class="mv"><button type="button" class="mvb" data-act="setTeam" data-id="${esc(p.id)}" data-team="${1 - t}" title="Move to ${esc(short(1 - t))}">→ ${esc(short(1 - t))}</button>
+          <button type="button" class="mvb x" data-act="setTeam" data-id="${esc(p.id)}" data-team="none" title="Unassign" aria-label="Unassign ${esc(p.name)}">✕</button></span>` : ''}
+      </li>`;
+    const nameBox = (t) => {
+      if (S.canRename[t]) {
+        const val = teamDrafts[t] !== undefined ? teamDrafts[t] : S.teamNames[t];
+        return `<div class="tn-row"><input class="tn" data-team="${t}" type="text" maxlength="20" value="${esc(val)}" placeholder="Team name" aria-label="Name for this team" autocomplete="off">
+          <button type="button" class="mvb" data-act="saveName" data-team="${t}">Save</button></div>
+          <div class="tn-note">✎ You choose this team’s name</div>`;
+      }
+      const who = S.namers[t];
+      return who ? `<div class="tn-note">✎ ${esc(who)} chooses this team’s name</div>` : '';
+    };
+    const col = (t) => `<div class="team t${t}"><h3>${esc(teamName(t))} (${inTeam(t).length})</h3>${nameBox(t)}<ul>${inTeam(t).map((p) => row(p, t)).join('') || '<li class="empty">No players yet</li>'}</ul></div>`;
+    const poolHtml = pool.length ? `
+      <div class="pool">
+        <h3>Not on a team yet (${pool.length})</h3>
+        <ul>${pool.map((p) => `<li><span class="pn">${esc(p.name)}${p.id === S.me.id ? ' (you)' : ''}</span>
+          ${host ? `<span class="mv"><button type="button" class="mvb c0" data-act="setTeam" data-id="${esc(p.id)}" data-team="0">${esc(teamName(0))}</button>
+            <button type="button" class="mvb c1" data-act="setTeam" data-id="${esc(p.id)}" data-team="1">${esc(teamName(1))}</button></span>` : ''}</li>`).join('')}</ul>
+      </div>` : '';
+    let status = '';
+    let ready = true;
+    if (pool.length) { ready = false; status = `Assign ${pool.length} more player${pool.length > 1 ? 's' : ''} to a team to continue.`; }
+    else if (!n0 || !n1) { ready = false; status = 'Each team needs at least one player.'; }
+    else if (Math.abs(n0 - n1) > 1) status = `Heads up: teams are uneven (${n0} vs ${n1}). You can still play.`;
+    const you = mine === 0 || mine === 1
+      ? `You’re on <b style="color:${colorFor(mine)}">${esc(teamName(mine))}</b>.`
+      : 'You’re not on a team yet.';
     view(null, `
       <div class="card wide">
-        <h2 class="center">Meet the teams!</h2>
-        <p class="center muted" style="margin-top:0">${S.totalCards} cards are in the bowl. You’re on <b style="color:${colorFor(mine)}">${esc(teamName(mine))}</b>.</p>
+        <h2 class="center">${host ? 'Set up the teams' : 'Meet the teams!'}</h2>
+        <p class="center muted" style="margin-top:0">${S.totalCards} cards are in the bowl. ${you}</p>
+        ${host ? '<p class="center muted small" style="margin:0 0 12px">Shuffle randomly, or tap a player’s button to move them between teams. You name your team; one player on the other team names theirs.</p>' : ''}
         <div class="teams">${col(0)}${col(1)}</div>
+        ${poolHtml}
         <div class="stack" style="margin-top:18px">
-          ${S.me.isHost ? `<button class="btn block big" data-act="continue">Looks good – let’s go!</button>
-            <button class="btn block ghost" data-act="reshuffle">🔀 Shuffle teams</button>` : '<div class="center muted" style="font-weight:600">Waiting for the host to continue…</div>'}
+          ${host ? `
+            <button class="btn block big" data-act="continue" ${ready ? '' : 'disabled'}>Looks good – let’s go!</button>
+            ${status ? `<div class="center small" style="font-weight:600;color:${ready ? '#6b5400' : 'var(--bad)'}">${esc(status)}</div>` : ''}
+            <div class="row" style="gap:10px">
+              <button class="btn ghost" style="flex:1" data-act="reshuffle">🔀 Shuffle randomly</button>
+              <button class="btn ghost" style="flex:1" data-act="clearTeams">✋ Pick manually</button>
+            </div>`
+            : '<div class="center muted" style="font-weight:600">Waiting for the host to finalise the teams…</div>'}
         </div>
       </div>`);
+    if (focus) {
+      const el = $(`.tn[data-team="${focus.team}"]`);
+      if (el) { el.focus(); try { el.setSelectionRange(focus.a, focus.b); } catch { /* */ } }
+    }
+  }
+
+  async function continueFromTeams() {
+    // don't lose a name that was typed but not saved yet
+    for (const t of [0, 1]) {
+      if (teamDrafts[t] !== undefined && S.canRename[t]) { if (!(await saveTeamName(t))) return; }
+    }
+    return act('toRoundIntro');
   }
 
   /* ---------- round intro ---------- */
@@ -333,9 +403,51 @@
       </div>`);
   }
 
+  /* ---------- end-of-turn review ---------- */
+  function renderReview() {
+    const t = S.turn; const me = S.me;
+    const isGiver = t.giverId === me.id;
+    const canEdit = isGiver || me.isHost;
+    const list = t.review || [];
+    const n = list.filter((c) => c.ok).length;
+    const reasonText = t.reason === 'time' ? 'Time’s up!' : t.reason === 'bowlEmpty' ? 'The bowl is empty!' : 'Turn ended';
+    const reasonIcon = t.reason === 'time' ? '⏰' : t.reason === 'bowlEmpty' ? '🎉' : '🏁';
+    const lastRound = S.bowlLeft === 0;
+    const confirmLabel = lastRound ? (S.round >= 3 ? 'Confirm & see results' : `Confirm & finish round ${S.round}`) : 'Confirm & next turn';
+    const rows = list.map((c) => {
+      const inner = `<span class="box">✓</span><span class="txt">${esc(c.text)}</span><span class="st">${c.ok ? 'Guessed' : 'Not guessed'}</span>`;
+      return `<li>${canEdit
+        ? `<button type="button" class="rv-item ${c.ok ? 'on' : ''}" data-act="toggle" data-id="${c.id}" aria-pressed="${c.ok}">${inner}</button>`
+        : `<div class="rv-item readonly ${c.ok ? 'on' : ''}">${inner}</div>`}</li>`;
+    }).join('');
+    const intro = isGiver
+      ? `Tick any card your team guessed that wasn’t counted, and untick any that were counted by mistake. Unticked cards go back in the bowl.`
+      : canEdit
+        ? `You’re the host – you can fix this list if ${esc(t.giverName)} is away.`
+        : `${esc(t.giverName)} is checking which cards were guessed…`;
+    const y = window.scrollY;
+    view(null, scorebar() + `
+      <div class="card wide">
+        <div class="review-head">
+          <div class="big-emoji">${reasonIcon}</div>
+          <h2 style="margin:6px 0 0">${reasonText}</h2>
+          <div class="muted" style="font-weight:600">${esc(t.giverName)} · <span style="color:${colorFor(t.team)}">${esc(teamName(t.team))}</span></div>
+          <div class="review-count">${n} guessed this turn</div>
+        </div>
+        <div class="rv-hint">${intro}</div>
+        ${list.length ? `<ul class="rv-list">${rows}</ul>` : '<div class="rv-empty">No cards came up this turn.</div>'}
+        <div style="margin-top:18px">
+          ${canEdit ? `<button class="btn block big sea" data-act="confirmReview">${confirmLabel}</button>`
+            : '<div class="center muted" style="font-weight:600">Waiting for the clue giver to confirm…</div>'}
+        </div>
+      </div>`);
+    window.scrollTo(0, y);
+  }
+
   /* ---------- playing ---------- */
   function renderPlaying() {
     const t = S.turn; const r = RULES[S.round - 1]; const me = S.me;
+    if (t.status === 'review') return renderReview();
     const isGiver = t.giverId === me.id;
     const sameTeam = me.team === t.team;
     let body = '';
@@ -423,7 +535,6 @@
     if (sec !== lastBeepSec) {
       lastBeepSec = sec;
       if (sec > 0 && sec <= 5) beep(520, .08);
-      if (sec === 0) buzzer();
     }
   }
   setInterval(tick, 150);
@@ -446,21 +557,28 @@
       case 'teams': return act('assignTeams');
       case 'forceTeams': return act('forceStartTeams');
       case 'reshuffle': return act('reshuffleTeams');
-      case 'continue': return act('toRoundIntro');
+      case 'clearTeams': return act('clearTeams');
+      case 'setTeam': return act('setTeam', { playerId: b.dataset.id, team: b.dataset.team === 'none' ? null : parseInt(b.dataset.team, 10) });
+      case 'saveName': return saveTeamName(parseInt(b.dataset.team, 10));
+      case 'continue': return continueFromTeams();
       case 'startRound': return act('startRound');
       case 'startTurn': return act('startTurn');
       case 'got': chime(); return act('got');
       case 'skip': return act('skip');
       case 'endTurn': return act('endTurn');
+      case 'toggle': return act('toggleCard', { cardId: parseInt(b.dataset.id, 10) });
+      case 'confirmReview': return act('confirmReview');
       case 'skipGiver': return act('skipGiver');
       case 'playAgain': return act('playAgain');
     }
   });
   app.addEventListener('change', (e) => { if (/^s_[wtsc]$/.test(e.target.id)) pushSettings(); });
+  app.addEventListener('input', (e) => { if (e.target.classList && e.target.classList.contains('tn')) teamDrafts[e.target.dataset.team] = e.target.value; });
   app.addEventListener('input', (e) => { if (e.target.id === 'jc') e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''); });
   app.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter') return;
     const t = e.target;
+    if (t.classList.contains('tn')) { e.preventDefault(); saveTeamName(parseInt(t.dataset.team, 10)); return; }
     if (t.id === 'hn') doCreate();
     else if (t.id === 'jn' || t.id === 'jc') doJoin(urlCode());
     else if (t.classList.contains('wi')) {
@@ -477,6 +595,6 @@
       catch { saveSession(null); }
     }
     renderLanding();
-    if (API) fetch(API + '/healthz').catch(() => {}); // wake a sleeping free-tier backend while the user types
+    if (API) fetch(API + '/healthz').catch(() => {}); // wake a sleeping backend while the user types
   })();
 })();

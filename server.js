@@ -12,11 +12,13 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const MIN_PLAYERS = parseInt(process.env.MIN_PLAYERS || '4', 10);
 const MAX_PLAYERS = 30;
 const MAX_ROOMS = 500;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*'; // e.g. https://play.yourdomain.com (comma-separated allowed)
+// Only needed if the website is hosted on a different domain than this server (comma-separated list).
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no I, O, 0, 1
-const TEAM_NAMES = ['Team Coral', 'Team Seafoam'];
+const DEFAULT_TEAM_NAMES = ['Team Coral', 'Team Seafoam'];
+const MAX_TEAM_NAME = 20;
 const ROUND_NAMES = ['Describe', 'Act it out', 'One word'];
 
 const rooms = new Map();
@@ -54,14 +56,16 @@ function createRoom() {
     touched: now(),
     hostId: null,
     phase: 'lobby', // lobby | writing | teams | roundIntro | playing | gameOver
+    teamNames: DEFAULT_TEAM_NAMES.slice(),
     settings: { wordsPerPlayer: 3, turnSeconds: 60, skips: 'unlimited', carryOver: true },
     players: [], // {id,name,team,words:[],submitted,conns:Set,connected,hostTimer}
     round: 0, // 1..3 once started
     scores: [[0, 0], [0, 0], [0, 0]], // [round][team]
-    bowl: [],
-    allCards: [],
+    bowl: [], // cards still to be guessed this round: {id,text}
+    allCards: [], // every card in the game: {id,text}
     pos: [0, 0], // rotation pointer per team
-    turn: null, // {team,giverId,status:'ready'|'active',durationMs,endsAt,current,guessed:[],skipsUsed}
+    // turn: {team,giverId,status:'ready'|'active'|'review',durationMs,endsAt,current,seen:[{id,text,ok}],skipsUsed,remainingMs,reason}
+    turn: null,
     carryMs: 0,
     lastTurn: null,
     timer: null,
@@ -88,10 +92,34 @@ function ensureHost(room) {
   if (next) room.hostId = next.id;
 }
 
+/* ---------- team naming ----------
+ * Who picks a team's name:
+ *   - the host, for the team the host is on
+ *   - for the other team: one person (the first connected member), so there is exactly one namer per team
+ *   - if a team has nobody who can do it (empty / all offline) the host can name it
+ */
+function namerOf(room, team) {
+  const host = byId(room, room.hostId);
+  if (host && host.team === team) return host;
+  return room.players.find((q) => q.team === team && q.connected) || null;
+}
+function canRename(room, p, team) {
+  if (room.phase !== 'teams') return false;
+  const namer = namerOf(room, team);
+  return namer ? namer.id === p.id : room.hostId === p.id;
+}
+
 /* ---------- view (personalised, so the secret card is only sent to the clue giver) ---------- */
+function skipsLeft(room, t) {
+  const s = room.settings.skips;
+  if (s === 'unlimited') return -1;
+  if (s === 'none') return 0;
+  return Math.max(0, 1 - t.skipsUsed);
+}
+
 function viewFor(room, p) {
   const t = room.turn;
-  const isGiver = t && t.giverId === p.id;
+  const isGiver = !!t && t.giverId === p.id;
   const giver = t ? byId(room, t.giverId) : null;
   return {
     serverTime: now(),
@@ -100,7 +128,9 @@ function viewFor(room, p) {
     phase: room.phase,
     settings: room.settings,
     roundNames: ROUND_NAMES,
-    teamNames: TEAM_NAMES,
+    teamNames: room.teamNames,
+    canRename: [canRename(room, p, 0), canRename(room, p, 1)],
+    namers: [namerOf(room, 0), namerOf(room, 1)].map((q) => (q ? q.name : null)),
     me: { id: p.id, name: p.name, team: p.team, isHost: room.hostId === p.id, words: p.words, submitted: p.submitted },
     players: room.players.map((q) => ({
       id: q.id, name: q.name, team: q.team, connected: q.connected, submitted: q.submitted, isHost: room.hostId === q.id,
@@ -108,7 +138,7 @@ function viewFor(room, p) {
     round: room.round,
     scores: room.scores,
     totals: totals(room),
-    bowlLeft: room.bowl.length + (t && t.current != null ? 1 : 0),
+    bowlLeft: room.bowl.length + (t && t.current ? 1 : 0),
     totalCards: room.allCards.length,
     carryMs: room.carryMs,
     lastTurn: room.lastTurn,
@@ -121,19 +151,16 @@ function viewFor(room, p) {
           status: t.status,
           durationMs: t.durationMs,
           endsAt: t.endsAt,
-          guessedCount: t.guessed.length,
+          guessedCount: t.seen.filter((c) => c.ok).length,
           skipsLeft: skipsLeft(room, t),
+          reason: t.reason,
+          // review screen: every card that came up this turn, ticked if it counts as guessed
+          review: t.status === 'review' ? t.seen.map((c) => ({ id: c.id, text: c.text, ok: c.ok })) : undefined,
         }
       : null,
-    card: isGiver && t.status === 'active' ? t.current : null,
-    guessedThisTurn: isGiver ? t.guessed : undefined,
+    card: isGiver && t.status === 'active' && t.current ? t.current.text : null,
+    guessedThisTurn: isGiver ? t.seen.filter((c) => c.ok).map((c) => c.text) : undefined,
   };
-}
-function skipsLeft(room, t) {
-  const s = room.settings.skips;
-  if (s === 'unlimited') return -1;
-  if (s === 'none') return 0;
-  return Math.max(0, 1 - t.skipsUsed);
 }
 
 function broadcast(room) {
@@ -167,7 +194,10 @@ function pickGiver(room, team) {
 }
 
 function prepareTurn(room, team, giver, durationMs) {
-  room.turn = { team, giverId: giver.id, status: 'ready', durationMs, endsAt: null, current: null, guessed: [], skipsUsed: 0 };
+  room.turn = {
+    team, giverId: giver.id, status: 'ready', durationMs, endsAt: null,
+    current: null, seen: [], skipsUsed: 0, remainingMs: 0, reason: null,
+  };
 }
 
 function nextTurn(room) {
@@ -177,29 +207,38 @@ function nextTurn(room) {
   prepareTurn(room, team, giver, room.settings.turnSeconds * 1000);
 }
 
-function finishTurn(room, reason) {
-  // reason: 'time' | 'done' | 'roundComplete'
+function noteSeen(t, card) {
+  if (!t.seen.some((c) => c.id === card.id)) t.seen.push({ id: card.id, text: card.text, ok: false });
+}
+
+/* Step 1: the turn is over (time ran out, giver ended it, or the bowl is empty).
+ * Cards that were not guessed go back into the bowl and everyone sees the review screen. */
+function endTurnToReview(room, reason) {
   const t = room.turn;
-  if (!t) return;
+  if (!t || t.status !== 'active') return;
   clearTimer(room);
-  const remaining = t.endsAt ? Math.max(0, t.endsAt - now()) : 0;
-  if (t.current != null) {
+  t.remainingMs = t.endsAt ? Math.max(0, t.endsAt - now()) : 0;
+  if (t.current) {
     room.bowl.splice(crypto.randomInt(room.bowl.length + 1), 0, t.current);
     t.current = null;
   }
+  t.reason = reason; // 'time' | 'done' | 'bowlEmpty'
+  t.status = 'review';
+}
+
+/* Step 2: the clue giver (or host) confirms the reviewed list -> next turn, or the round is over. */
+function confirmReview(room) {
+  const t = room.turn;
+  if (!t || t.status !== 'review') return;
   const giver = byId(room, t.giverId);
-  room.lastTurn = { giverName: giver ? giver.name : '?', team: t.team, guessed: t.guessed.slice(), reason, round: room.round };
-  if (reason === 'roundComplete') {
-    room.carryMs = room.settings.carryOver && remaining > 3000 ? remaining : 0;
+  const guessed = t.seen.filter((c) => c.ok).map((c) => c.text);
+  room.lastTurn = { giverName: giver ? giver.name : '?', team: t.team, guessed, reason: t.reason, round: room.round };
+  if (room.bowl.length === 0) {
+    room.carryMs = room.settings.carryOver && t.remainingMs > 3000 ? t.remainingMs : 0;
     room.carryTeam = t.team;
     room.carryGiver = t.giverId;
-    if (room.round >= 3) {
-      room.phase = 'gameOver';
-      room.turn = null;
-    } else {
-      room.phase = 'roundIntro';
-      room.turn = null;
-    }
+    room.turn = null;
+    room.phase = room.round >= 3 ? 'gameOver' : 'roundIntro';
   } else {
     nextTurn(room);
   }
@@ -213,8 +252,7 @@ function startRound(room) {
   if (carry) {
     prepareTurn(room, room.carryTeam, byId(room, room.carryGiver), room.carryMs);
   } else if (room.round === 1) {
-    const giver = pickGiver(room, 0);
-    prepareTurn(room, 0, giver, room.settings.turnSeconds * 1000);
+    prepareTurn(room, 0, pickGiver(room, 0), room.settings.turnSeconds * 1000);
   } else {
     const prevTeam = room.lastTurn ? room.lastTurn.team : 1;
     const team = 1 - prevTeam;
@@ -229,6 +267,10 @@ function assignTeams(room) {
   room.pos = [0, 0];
 }
 
+function buildBowl(room) {
+  room.allCards = room.players.flatMap((q) => q.words).map((text, id) => ({ id, text }));
+}
+
 function resetToLobby(room) {
   clearTimer(room);
   room.phase = 'lobby';
@@ -240,6 +282,7 @@ function resetToLobby(room) {
   room.lastTurn = null;
   room.carryMs = 0;
   room.pos = [0, 0];
+  room.teamNames = DEFAULT_TEAM_NAMES.slice();
   room.players = room.players.filter((p) => p.connected || room.hostId === p.id);
   for (const p of room.players) { p.words = []; p.submitted = false; p.team = null; }
 }
@@ -304,7 +347,7 @@ function handleAction(room, p, a) {
       if (!isHost || room.phase !== 'writing') return fail('Only the host can do that.');
       if (room.players.some((q) => !q.submitted)) return fail('Waiting for everyone to submit.');
       if (room.players.length < MIN_PLAYERS) return fail(`Need at least ${MIN_PLAYERS} players.`);
-      room.allCards = room.players.flatMap((q) => q.words);
+      buildBowl(room);
       assignTeams(room);
       room.phase = 'teams';
       return {};
@@ -313,7 +356,7 @@ function handleAction(room, p, a) {
       if (!isHost || room.phase !== 'writing') return fail('Only the host can do that.');
       room.players = room.players.filter((q) => q.submitted);
       if (room.players.length < MIN_PLAYERS) return fail(`Need at least ${MIN_PLAYERS} players who have submitted cards.`);
-      room.allCards = room.players.flatMap((q) => q.words);
+      buildBowl(room);
       assignTeams(room);
       room.phase = 'teams';
       return {};
@@ -323,8 +366,42 @@ function handleAction(room, p, a) {
       assignTeams(room);
       return {};
     }
+    case 'setTeam': {
+      // Manual team selection: host moves one player to team 0 / team 1, or back to "unassigned" (null).
+      if (!isHost || room.phase !== 'teams') return fail('Only the host can do that.');
+      const q = byId(room, a.playerId);
+      if (!q) return fail('Unknown player.');
+      const team = a.team === null || a.team === 'none' ? null : parseInt(a.team, 10);
+      if (team !== null && team !== 0 && team !== 1) return fail('Unknown team.');
+      q.team = team;
+      return {};
+    }
+    case 'renameTeam': {
+      const team = parseInt(a.team, 10);
+      if (team !== 0 && team !== 1) return fail('Unknown team.');
+      if (room.phase !== 'teams') return fail('Team names can only be changed while teams are being set up.');
+      if (!canRename(room, p, team)) {
+        const nm = namerOf(room, team);
+        return fail(nm ? `Only ${nm.name} can name this team.` : 'Only the host can name this team.');
+      }
+      const name = clean(a.name, MAX_TEAM_NAME);
+      const final = name || DEFAULT_TEAM_NAMES[team]; // empty = back to default
+      if (room.teamNames[1 - team].toLowerCase() === final.toLowerCase()) return fail('The other team already uses that name.');
+      room.teamNames[team] = final;
+      return {};
+    }
+    case 'clearTeams': {
+      // Start from a blank slate so the host can pick every player by hand.
+      if (!isHost || room.phase !== 'teams') return fail('Only the host can do that.');
+      for (const q of room.players) q.team = null;
+      return {};
+    }
     case 'toRoundIntro': {
       if (!isHost || room.phase !== 'teams') return fail('Only the host can do that.');
+      const unassigned = room.players.filter((q) => q.team !== 0 && q.team !== 1);
+      if (unassigned.length) return fail(`Assign ${unassigned.length === 1 ? unassigned[0].name : unassigned.length + ' players'} to a team first.`);
+      if (!teamPlayers(room, 0).length || !teamPlayers(room, 1).length) return fail('Each team needs at least one player.');
+      room.pos = [0, 0];
       room.phase = 'roundIntro';
       room.round = 0;
       return {};
@@ -340,20 +417,23 @@ function handleAction(room, p, a) {
       t.status = 'active';
       t.endsAt = now() + t.durationMs;
       t.current = room.bowl.shift();
+      noteSeen(t, t.current);
       clearTimer(room);
-      room.timer = setTimeout(() => { finishTurn(room, 'time'); broadcast(room); }, t.durationMs + 100);
+      room.timer = setTimeout(() => { endTurnToReview(room, 'time'); broadcast(room); }, t.durationMs + 100);
       return {};
     }
     case 'got': {
       if (room.phase !== 'playing' || !t || t.status !== 'active' || t.giverId !== p.id) return fail('Not allowed.');
-      if (t.current == null) return {};
-      t.guessed.push(t.current);
+      if (!t.current) return {};
+      const e = t.seen.find((c) => c.id === t.current.id);
+      if (e) e.ok = true;
       room.scores[room.round - 1][t.team] += 1;
       t.current = null;
       if (room.bowl.length === 0) {
-        finishTurn(room, 'roundComplete');
+        endTurnToReview(room, 'bowlEmpty');
       } else {
         t.current = room.bowl.shift();
+        noteSeen(t, t.current);
       }
       return {};
     }
@@ -363,12 +443,39 @@ function handleAction(room, p, a) {
       if (room.bowl.length === 0) return fail('This is the last card – no other card to skip to.');
       room.bowl.push(t.current);
       t.current = room.bowl.shift();
+      noteSeen(t, t.current);
       t.skipsUsed += 1;
       return {};
     }
     case 'endTurn': {
       if (room.phase !== 'playing' || !t || t.status !== 'active' || t.giverId !== p.id) return fail('Not allowed.');
-      finishTurn(room, 'done');
+      endTurnToReview(room, 'done');
+      return {};
+    }
+    case 'toggleCard': {
+      // Review screen: tick a card that was guessed but missed, or untick one counted by mistake.
+      if (room.phase !== 'playing' || !t || t.status !== 'review') return fail('Nothing to review.');
+      if (t.giverId !== p.id && !isHost) return fail('Only the clue giver can edit the review.');
+      const e = t.seen.find((c) => c.id === a.cardId);
+      if (!e) return fail('Unknown card.');
+      const sc = room.scores[room.round - 1];
+      if (e.ok) {
+        e.ok = false;
+        sc[t.team] -= 1;
+        room.bowl.splice(crypto.randomInt(room.bowl.length + 1), 0, { id: e.id, text: e.text });
+      } else {
+        const i = room.bowl.findIndex((c) => c.id === e.id);
+        if (i < 0) return fail('That card is no longer available.');
+        room.bowl.splice(i, 1);
+        e.ok = true;
+        sc[t.team] += 1;
+      }
+      return {};
+    }
+    case 'confirmReview': {
+      if (room.phase !== 'playing' || !t || t.status !== 'review') return fail('Nothing to confirm.');
+      if (t.giverId !== p.id && !isHost) return fail('Only the clue giver can confirm.');
+      confirmReview(room);
       return {};
     }
     case 'skipGiver': {
@@ -396,7 +503,7 @@ function handleAction(room, p, a) {
 /* ---------- HTTP ---------- */
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
-  '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json', '.webmanifest': 'application/manifest+json',
+  '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json',
 };
 const SECURITY = {
   'X-Content-Type-Options': 'nosniff',
@@ -417,13 +524,13 @@ function readBody(req) {
   });
 }
 function serveStatic(req, res, urlPath) {
-  let rel = urlPath === '/' || /^\/r\/[A-Za-z0-9]{4}\/?$/.test(urlPath) ? '/index.html' : urlPath;
+  const rel = urlPath === '/' || /^\/r\/[A-Za-z0-9]{4}\/?$/.test(urlPath) ? '/index.html' : urlPath;
   const file = path.normalize(path.join(PUBLIC_DIR, rel));
   if (!file.startsWith(PUBLIC_DIR)) { res.writeHead(403); return res.end('Forbidden'); }
   fs.readFile(file, (err, buf) => {
     if (err) { res.writeHead(404, { 'Content-Type': 'text/plain' }); return res.end('Not found'); }
     const ext = path.extname(file);
-    const cache = ext === '.html' ? 'no-cache' : 'public, max-age=3600';
+    const cache = ext === '.html' || ext === '.js' || ext === '.css' ? 'no-cache' : 'public, max-age=3600';
     res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream', 'Cache-Control': cache, ...SECURITY });
     res.end(buf);
   });
@@ -432,7 +539,7 @@ function serveStatic(req, res, urlPath) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const p = url.pathname;
-  // CORS: lets the Netlify-hosted front end call this API from another domain
+  // CORS (only matters if the website is served from a different domain than this server)
   const origin = req.headers.origin;
   if (origin) {
     const ok = ALLOWED_ORIGIN === '*' || ALLOWED_ORIGIN.split(',').map((x) => x.trim().replace(/\/$/, '')).includes(origin);
@@ -463,8 +570,7 @@ const server = http.createServer(async (req, res) => {
       const code = clean(b.code, 8).toUpperCase();
       const room = rooms.get(code);
       if (!room) return sendJSON(res, 404, fail("We couldn't find that game. Check the code and try again."));
-      // reconnect
-      if (b.pid) {
+      if (b.pid) { // reconnect
         const ex = byId(room, String(b.pid));
         if (ex) return sendJSON(res, 200, { code, pid: ex.id });
       }
