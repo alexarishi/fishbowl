@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b3b5c">
+  <title>Fishbowl – play the party guessing game online</title>
+  <meta name="description" content="Play Fishbowl online with friends: three rounds of describe, act it out and one-word clues. Free, no sign-up – just share a link.">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="bubbles" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  <header class="top">
+    <a class="brand" href="/" aria-label="Fishbowl home"><span class="logo">🐠</span><span>Fishbowl</span></a>
+    <div class="top-right">
+      <button id="muteBtn" class="icon-btn" title="Toggle sound" aria-label="Toggle sound">🔊</button>
+      <button id="helpBtn" class="icon-btn" title="How to play" aria-label="How to play">?</button>
+    </div>
+  </header>
+  <main id="app" aria-live="polite"></main>
+  <div id="toast" class="toast" role="status"></div>
+
+  <dialog id="helpDlg">
+    <form method="dialog">
+      <h2>How to play</h2>
+      <p>Everyone writes a few names, places or phrases on cards. All cards go into the bowl, and players are split into two teams. The <b>same cards</b> are used in three rounds – each time the clues get tougher.</p>
+      <ol class="rules">
+        <li><b>Round 1 · Describe.</b> Use any words to describe the card. Don't say any part of it, and no gestures.</li>
+        <li><b>Round 2 · Act it out.</b> No words, no sounds – gestures only.</li>
+        <li><b>Round 3 · One word.</b> You may say exactly one word. Lean on what you remember from earlier rounds!</li>
+      </ol>
+      <p>On your turn, you have the timer to get your team to guess as many cards as possible. Guessed cards score a point for your team; skipped cards go back in the bowl. When your turn ends you review the cards and fix any that were missed. Most points after three rounds wins.</p>
+      <p class="muted">Tip: play on a video call so everyone can hear the guesses – the clue giver taps <b>Got it!</b> when their team says the right answer.</p>
+      <button class="btn">Got it</button>
+    </form>
+  </dialog>
+
+  <script src="/config.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
