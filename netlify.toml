@@ -1,0 +1,3 @@
+[build]
+  publish = "public"
+  # no build command – it's plain static files

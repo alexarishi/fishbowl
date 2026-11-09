@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: fishbowl-server
+    runtime: node
+    plan: free
+    buildCommand: "echo no build needed"
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: ALLOWED_ORIGIN
+        sync: false   # set to your Netlify/custom-domain URL in the Render dashboard
