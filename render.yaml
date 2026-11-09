@@ -1,8 +1,0 @@
-services:
-  - type: web
-    name: fishbowl
-    runtime: node
-    plan: free
-    buildCommand: "echo no build needed"
-    startCommand: node server.js
-    healthCheckPath: /healthz
