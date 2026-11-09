@@ -25,7 +25,8 @@
   let audioCtx = null;
   let lastBeepSec = null;
   let prevTurnSig = '';
-  const teamDrafts = {}; // unsaved team-name text per team, so a live refresh never wipes what you're typing
+  let prevUpNextMe = false;
+  const teamDrafts = {};   // unsaved team-name text per team, so a live refresh never wipes what you're typing
 
   /* ---------- storage ---------- */
   function loadSession() { try { return JSON.parse(localStorage.getItem('fb_session') || 'null'); } catch { return null; } }
@@ -59,7 +60,7 @@
   async function post(path, body) {
     const r = await fetch(API + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     let j = {}; try { j = await r.json(); } catch { /* */ }
-    if (!r.ok) throw new Error(j.error || 'Something went wrong.');
+    if (!r.ok) { const err = new Error(j.error || 'Something went wrong.'); err.data = j; throw err; }
     return j;
   }
   async function act(type, extra = {}) {
@@ -71,6 +72,30 @@
   const joinUrl = () => `${location.origin}/r/${S.code}`;
   const colorFor = (t) => (t == null ? '#6b8aa0' : TEAM_COLORS[t]);
   const nowSrv = () => Date.now() + offset;
+
+  /* ---------- always-visible chrome: who I am (top) + who is up next (bottom) ---------- */
+  function updateChrome() {
+    const pill = $('#mePill'); const bar = $('#nextBar');
+    if (!S || !session) {
+      pill.hidden = true; bar.hidden = true; document.body.classList.remove('has-nextbar'); prevUpNextMe = false; return;
+    }
+    const me = S.me;
+    pill.hidden = false;
+    pill.title = me.team === 0 || me.team === 1 ? `${me.name} · ${teamName(me.team)}` : me.name;
+    pill.innerHTML = `<span class="dot" style="background:${colorFor(me.team)}"></span><span class="lbl">Playing as</span><b>${esc(me.name)}</b>`;
+
+    const n = S.phase === 'playing' ? S.upNext : null;
+    if (!n) { bar.hidden = true; document.body.classList.remove('has-nextbar'); prevUpNextMe = false; return; }
+    const you = n.id === me.id;
+    bar.hidden = false;
+    bar.classList.toggle('you', you);
+    bar.innerHTML = you
+      ? `<div class="in"><span class="lbl">UP NEXT</span><b>You’re up next – get ready!</b><span class="tm">${esc(teamName(n.team))}</span></div>`
+      : `<div class="in"><span class="lbl">UP NEXT</span><b>${esc(n.name)}</b><span class="tm" style="color:${colorFor(n.team)}">${esc(teamName(n.team))}</span>${n.connected ? '' : '<span class="off">offline</span>'}</div>`;
+    document.body.classList.add('has-nextbar');
+    if (you && !prevUpNextMe && navigator.vibrate) navigator.vibrate(120); // a gentle nudge the moment you become "up next"
+    prevUpNextMe = you;
+  }
 
   /* ---------- connection ---------- */
   function connect() {
@@ -117,6 +142,7 @@
     }
     if (location.pathname !== `/r/${S.code}`) history.replaceState(null, '', `/r/${S.code}`);
     if (S.phase !== 'teams') { delete teamDrafts[0]; delete teamDrafts[1]; }
+    updateChrome();
     switch (S.phase) {
       case 'lobby': return renderLobby();
       case 'writing': return renderWriting();
@@ -130,6 +156,7 @@
   /* ---------- landing ---------- */
   function renderLanding(msg) {
     viewKey = null;
+    updateChrome();
     const code = urlCode();
     const savedName = localStorage.getItem('fb_name') || '';
     app.innerHTML = `
@@ -195,7 +222,7 @@
 
   function scorebar() {
     const t = S.turn; const [a, b] = S.totals;
-    const act = t && S.phase === 'playing' ? t.team : -1;
+    const act = t && S.phase === 'playing' && t.team != null ? t.team : -1;
     return `<div class="scorebar">
       <div class="sb t0 ${act === 0 ? 'active' : ''}"><span class="nm">${esc(teamName(0))}</span><span class="pts">${a}</span></div>
       <div class="roundpill"><span>ROUND</span><b>${Math.max(1, Math.min(3, S.phase === 'roundIntro' ? S.round + 1 : S.round))}/3</b></div>
@@ -268,7 +295,8 @@
         <p class="muted" style="margin-top:0">Add ${n} famous people, characters, places, movies, things or phrases that most of the group would know. Keep them short!</p>
         <div class="words">${Array.from({ length: n }, (_, i) => `
           <div class="w"><span class="n">${i + 1}</span><input type="text" class="wi" maxlength="60" placeholder="${['e.g. Eiffel Tower', 'e.g. Harry Potter', 'e.g. Pizza night', 'e.g. Taylor Swift', 'e.g. Roller coaster', 'e.g. Mount Everest'][i % 6]}" value="${esc(me.words[i] || '')}"></div>`).join('')}</div>
-        <div class="tips">💡 Avoid cards only you would know – and don’t overthink it. Everyone will have to guess them!</div>
+        <div class="word-err" id="werr" role="alert" hidden></div>
+        <div class="tips">💡 Avoid cards only you would know – and don’t overthink it. Every card must be different from everyone else’s (capital letters don’t count as different).</div>
         <button class="btn block big" data-act="submitWords">Add to the bowl</button>
         <div id="wstatus" style="margin-top:14px"></div>
       </div>`;
@@ -290,10 +318,27 @@
       }
     });
   }
-  function submitWords() {
-    const words = [...document.querySelectorAll('.wi')].map((i) => i.value.trim());
-    if (words.some((w) => !w)) return toast(`Please fill in all ${words.length} cards.`, true);
-    act('submitWords', { words });
+  function clearWordErrors() {
+    document.querySelectorAll('.wi.bad').forEach((i) => i.classList.remove('bad'));
+    const e = $('#werr'); if (e) { e.hidden = true; e.textContent = ''; }
+  }
+  function showWordError(msg, idxs) {
+    const inputs = [...document.querySelectorAll('.wi')];
+    (idxs || []).forEach((i) => { if (inputs[i]) inputs[i].classList.add('bad'); });
+    const e = $('#werr'); if (e) { e.textContent = msg; e.hidden = false; }
+    const first = inputs[(idxs && idxs[0]) || 0]; if (first && idxs && idxs.length) first.focus();
+    if (e) e.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+  async function submitWords() {
+    const inputs = [...document.querySelectorAll('.wi')];
+    const words = inputs.map((i) => i.value.trim());
+    clearWordErrors();
+    if (words.some((w) => !w)) {
+      const empty = words.map((w, i) => (w ? -1 : i)).filter((i) => i >= 0);
+      return showWordError(`Please fill in all ${words.length} cards.`, empty);
+    }
+    try { await post('/api/action', { code: session.code, pid: session.pid, type: 'submitWords', words }); }
+    catch (e) { showWordError(e.message, e.data && e.data.dupIndexes); }   // e.g. "Something similar is already in the pool…"
   }
 
   /* ---------- teams ---------- */
@@ -373,7 +418,6 @@
       if (el) { el.focus(); try { el.setSelectionRange(focus.a, focus.b); } catch { /* */ } }
     }
   }
-
   async function continueFromTeams() {
     // don't lose a name that was typed but not saved yet
     for (const t of [0, 1]) {
@@ -464,7 +508,7 @@
             : '<button class="btn big block" data-act="startTurn">Start my turn</button>'}${lastLine}</div>`;
       } else {
         body = `<div class="card wide center">
-          <div class="muted small" style="font-weight:800;letter-spacing:1px">UP NEXT</div>
+          <div class="muted small" style="font-weight:800;letter-spacing:1px">UP NOW</div>
           <div class="big-name">${esc(t.giverName)}</div>
           <div style="color:${colorFor(t.team)};font-weight:800">${esc(teamName(t.team))}</div>
           <p style="margin:10px 0"><span class="ruleflag">${r.icon} ${esc(r.name)}</span></p>
@@ -574,8 +618,12 @@
     }
   });
   app.addEventListener('change', (e) => { if (/^s_[wtsc]$/.test(e.target.id)) pushSettings(); });
-  app.addEventListener('input', (e) => { if (e.target.classList && e.target.classList.contains('tn')) teamDrafts[e.target.dataset.team] = e.target.value; });
-  app.addEventListener('input', (e) => { if (e.target.id === 'jc') e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''); });
+  app.addEventListener('input', (e) => {
+    const c = e.target.classList;
+    if (c && c.contains('tn')) teamDrafts[e.target.dataset.team] = e.target.value;
+    if (c && c.contains('wi')) { e.target.classList.remove('bad'); if (!document.querySelector('.wi.bad')) { const w = $('#werr'); if (w) { w.hidden = true; w.textContent = ''; } } }
+    if (e.target.id === 'jc') e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  });
   app.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter') return;
     const t = e.target;

@@ -20,10 +20,11 @@ async function makeRoom(names) {
   for (const c of cs) await c.connect(); await sleep(150);
   return cs;
 }
+// every player writes 3 DIFFERENT cards (cards must be unique across the whole pool)
 async function toTeams(cs, extra = {}) {
   await cs[0].act('updateSettings', { wordsPerPlayer: 3, turnSeconds: extra.turnSeconds || 30, skips: 'unlimited', carryOver: true });
   await cs[0].act('startWriting');
-  for (const c of cs) await c.act('submitWords', { words: ['Pizza', `${c.name}-1`, `${c.name}-2`] }); // "Pizza" is duplicated on purpose
+  for (const c of cs) { const r = await c.act('submitWords', { words: [`${c.name}-1`, `${c.name}-2`, `${c.name}-3`] }); if (!r.ok) throw new Error('submit failed: ' + r.error); }
   await cs[0].act('assignTeams');
 }
 module.exports = { post, sleep, client, makeRoom, toTeams, BASE, PORT };

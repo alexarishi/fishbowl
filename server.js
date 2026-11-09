@@ -37,6 +37,8 @@ function shuffle(a) {
 function clean(s, max) {
   return String(s == null ? '' : s).replace(/[\u0000-\u001f\u007f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, max);
 }
+// Two cards are "the same" if they only differ by capital letters or spacing (Apple = apple = APPLE = " aPPle ").
+const cardKey = (s) => String(s).normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
 function newCode() {
   for (let n = 0; n < 1000; n++) {
     let c = '';
@@ -64,7 +66,7 @@ function createRoom() {
     bowl: [], // cards still to be guessed this round: {id,text}
     allCards: [], // every card in the game: {id,text}
     pos: [0, 0], // rotation pointer per team
-    // turn: {team,giverId,status:'ready'|'active'|'review',durationMs,endsAt,current,seen:[{id,text,ok}],skipsUsed,remainingMs,reason}
+    // turn: {team,giverId,status:'ready'|'active'|'review',durationMs,endsAt,current,seen:[{id,text,ok}],skipsUsed,remainingMs,reason,base}
     turn: null,
     carryMs: 0,
     lastTurn: null,
@@ -110,7 +112,8 @@ function canRename(room, p, team) {
   return namer ? namer.id === p.id : room.hostId === p.id;
 }
 
-/* ---------- view (personalised, so the secret card is only sent to the clue giver) ---------- */
+/* ---------- view (personalised: the secret card goes only to the clue giver, and the end-of-turn
+ * review list goes ONLY to the player whose turn just ended) ---------- */
 function skipsLeft(room, t) {
   const s = room.settings.skips;
   if (s === 'unlimited') return -1;
@@ -118,7 +121,7 @@ function skipsLeft(room, t) {
   return Math.max(0, 1 - t.skipsUsed);
 }
 
-/* Who will give clues next (read-only peek – does not move the rotation). */
+/* Who gives clues next for a team (read-only peek – does NOT move the rotation). */
 function peekGiver(room, team) {
   const list = teamPlayers(room, team);
   if (!list.length) return null;
@@ -129,11 +132,34 @@ function peekGiver(room, team) {
   return list[room.pos[team] % list.length];
 }
 
+/* "Up next" shown at the bottom of every in-game screen: the player whose turn comes AFTER the one on screen.
+ * Uses the same rotation as the game itself (alternate teams, round-robin inside each team). */
+function upNextFor(room, t, isGiver) {
+  if (!t || room.phase !== 'playing') return null;
+  let who = null;
+  if (t.status === 'review') {
+    if (isGiver) {
+      // the reviewer: the next turn starts once they confirm, so that is who is "up next" for them
+      if (room.bowl.length === 0) return null; // round is over, no next turn
+      who = peekGiver(room, 1 - t.team) || peekGiver(room, t.team);
+    } else {
+      // everyone else is already looking at the next turn's screen, so "up next" is the player after that one
+      if (t.base.bowlLeft === 0) return null;
+      const upcoming = peekGiver(room, 1 - t.team) || peekGiver(room, t.team);
+      const afterTeam = upcoming ? 1 - upcoming.team : t.team;
+      who = peekGiver(room, afterTeam) || peekGiver(room, 1 - afterTeam);
+    }
+  } else {
+    who = peekGiver(room, 1 - t.team) || peekGiver(room, t.team);
+  }
+  return who ? { id: who.id, name: who.name, team: who.team, connected: who.connected } : null;
+}
+
 function viewFor(room, p) {
   const t = room.turn;
   const isGiver = !!t && t.giverId === p.id;
   // While the clue giver reviews their turn, NOBODY ELSE gets a review screen or any review data.
-  // They carry straight on to the next turn's "up next" screen (the next giver just can't start until the review is
+  // They carry straight on to the next turn's "up now" screen (the next giver just can't start until the review is
   // confirmed) and keep seeing the scores / cards-left exactly as they were when the turn ended.
   const hidden = !!t && t.status === 'review' && !isGiver;
   const giver = t ? byId(room, t.giverId) : null;
@@ -198,6 +224,7 @@ function viewFor(room, p) {
     totalCards: room.allCards.length,
     carryMs: room.carryMs,
     lastTurn: room.lastTurn,
+    upNext: upNextFor(room, t, isGiver),
     turn: turnView,
     card: isGiver && t.status === 'active' && t.current ? t.current.text : null,
     guessedThisTurn: isGiver ? t.seen.filter((c) => c.ok).map((c) => c.text) : undefined,
@@ -328,7 +355,7 @@ function resetToLobby(room) {
   for (const p of room.players) { p.words = []; p.submitted = false; p.team = null; }
 }
 
-const fail = (msg) => ({ error: msg });
+const fail = (msg, extra) => ({ error: msg, ...(extra || {}) });
 
 function handleAction(room, p, a) {
   const isHost = room.hostId === p.id;
@@ -375,13 +402,31 @@ function handleAction(room, p, a) {
       const n = room.settings.wordsPerPlayer;
       const words = (Array.isArray(a.words) ? a.words : []).map((w) => clean(w, 60)).filter(Boolean);
       if (words.length !== n) return fail(`Please write exactly ${n} cards.`);
+
+      // 1) the same card twice in this player's own list (Banana + BANANA)
+      const own = new Set(); const repeated = [];
+      words.forEach((w, i) => { const k = cardKey(w); if (own.has(k)) repeated.push(i); else own.add(k); });
+      if (repeated.length) {
+        return fail(`You wrote the same card more than once. Please change: ${repeated.map((i) => words[i]).join(', ')}`, { dupIndexes: repeated });
+      }
+
+      // 2) cards already in the pool: whatever other players have submitted first (first come, first served).
+      // This runs on the server in a single step, so two players submitting at the same moment can't both get through.
+      const pool = new Set();
+      for (const q of room.players) if (q.id !== p.id && q.submitted) for (const w of q.words) pool.add(cardKey(w));
+      const clashes = [];
+      words.forEach((w, i) => { if (pool.has(cardKey(w))) clashes.push(i); });
+      if (clashes.length) {
+        return fail(`Something similar is already in the pool. Please change: ${clashes.map((i) => words[i]).join(', ')}`, { dupIndexes: clashes });
+      }
+
       p.words = words;
       p.submitted = true;
       return {};
     }
     case 'unsubmit': {
       if (room.phase !== 'writing') return fail('Too late to edit.');
-      p.submitted = false;
+      p.submitted = false; // their cards leave the pool until they submit again
       return {};
     }
     case 'assignTeams': {
@@ -407,16 +452,6 @@ function handleAction(room, p, a) {
       assignTeams(room);
       return {};
     }
-    case 'setTeam': {
-      // Manual team selection: host moves one player to team 0 / team 1, or back to "unassigned" (null).
-      if (!isHost || room.phase !== 'teams') return fail('Only the host can do that.');
-      const q = byId(room, a.playerId);
-      if (!q) return fail('Unknown player.');
-      const team = a.team === null || a.team === 'none' ? null : parseInt(a.team, 10);
-      if (team !== null && team !== 0 && team !== 1) return fail('Unknown team.');
-      q.team = team;
-      return {};
-    }
     case 'renameTeam': {
       const team = parseInt(a.team, 10);
       if (team !== 0 && team !== 1) return fail('Unknown team.');
@@ -435,6 +470,16 @@ function handleAction(room, p, a) {
       // Start from a blank slate so the host can pick every player by hand.
       if (!isHost || room.phase !== 'teams') return fail('Only the host can do that.');
       for (const q of room.players) q.team = null;
+      return {};
+    }
+    case 'setTeam': {
+      // Manual team selection: host moves one player to team 0 / team 1, or back to "unassigned" (null).
+      if (!isHost || room.phase !== 'teams') return fail('Only the host can do that.');
+      const q = byId(room, a.playerId);
+      if (!q) return fail('Unknown player.');
+      const team = a.team === null || a.team === 'none' ? null : parseInt(a.team, 10);
+      if (team !== null && team !== 0 && team !== 1) return fail('Unknown team.');
+      q.team = team;
       return {};
     }
     case 'toRoundIntro': {
@@ -495,7 +540,7 @@ function handleAction(room, p, a) {
       return {};
     }
     case 'toggleCard': {
-      // Review screen: tick a card that was guessed but missed, or untick one counted by mistake.
+      // Review screen (clue giver only): tick a card that was guessed but missed, or untick one counted by mistake.
       if (room.phase !== 'playing' || !t || t.status !== 'review') return fail('Nothing to review.');
       if (t.giverId !== p.id) return fail('Only the player whose turn just ended can review the cards.');
       const e = t.seen.find((c) => c.id === a.cardId);

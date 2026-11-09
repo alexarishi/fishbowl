@@ -1,4 +1,4 @@
-// Manual team distribution + random shuffle + team names (host + one player on the other team), v4 rules
+// Manual team distribution + random shuffle + team names (host + one player on the other team)
 const { server } = require('./server'); const assert = require('assert');
 const { sleep, makeRoom, toTeams, PORT } = require('./test_helpers');
 (async () => {
